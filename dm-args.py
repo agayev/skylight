@@ -34,8 +34,12 @@ parser.add_argument("cache_percent", type=int)
 
 args = parser.parse_args()
 
-assert args.track_size_in_bytes % 4096 == 0, \
-    "Track size must be a multiple of 4K."
+# Sanity checks.
+assert args.track_size_in_bytes % 4096 == 0 and \
+    512 * 1024 <= args.track_size_in_bytes <= 2 * 1024 * 1024, \
+    "Invalid track size."
+assert 20 <= args.band_size_in_tracks <= 200, "Invalid band size."
+assert 1 <= args.cache_percent <= 20, "Invalid cache percent."
 
 total_size_in_bytes = device_size(args.device)
 band_size_in_bytes = args.band_size_in_tracks * args.track_size_in_bytes

@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import sys
 
 SUFFIXES = {1000: ['KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'],
             1024: ['KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB']}
@@ -23,15 +24,13 @@ def device_size(device):
   finally:
     os.close(fd)
 
-parser = argparse.ArgumentParser(description="Calculate the usable space " \
-                                   "left on a device when emulating " \
-                                   "shingling on top of it.");
+parser = argparse.ArgumentParser(
+  description="Calculate device mapper arguments for a shingled device.")
 
 parser.add_argument("device")
 parser.add_argument("track_size_in_bytes", type=int)
 parser.add_argument("band_size_in_tracks", type=int)
 parser.add_argument("cache_percent", type=int)
-parser.add_argument("-v", "--verbose", action="store_true")
 
 args = parser.parse_args()
 
@@ -49,18 +48,19 @@ cache_size_in_bytes = num_cache_bands * band_size_in_bytes
 # are equally loaded.
 num_data_bands = (num_bands / num_cache_bands - 1) * num_cache_bands
 data_size_in_bytes = num_data_bands * band_size_in_bytes
+wasted_size_in_bytes = total_size_in_bytes - cache_size_in_bytes - \
+    data_size_in_bytes
 
-if args.verbose:
-  print 'Total size:', approximate_size(total_size_in_bytes)
-  print 'Band size:', approximate_size(band_size_in_bytes)
-  print 'Total number of bands:', num_bands
-  print 'Number of cache bands:', num_cache_bands
-  print 'Cache size:', approximate_size(cache_size_in_bytes)
-  print 'Number of data bands:', num_data_bands
-  print 'Usable disk size:', approximate_size(data_size_in_bytes)
-  print 'Wasted disk size due to alignment:', \
-      approximate_size(total_size_in_bytes -
-                       cache_size_in_bytes -
-                       data_size_in_bytes)
-else:
-  print data_size_in_bytes,
+print '# Total disk size:', approximate_size(total_size_in_bytes)
+print '# Band size:', approximate_size(band_size_in_bytes)
+print '# Total number of bands:', num_bands
+print '# Number of cache bands:', num_cache_bands
+print '# Cache size:', approximate_size(cache_size_in_bytes)
+print '# Number of data bands:', num_data_bands
+print '# Usable disk size:', approximate_size(data_size_in_bytes)
+print '# Wasted disk size due to alignment:', \
+    approximate_size(wasted_size_in_bytes)
+print
+print 0, data_size_in_bytes, 'shingle', \
+    args.device, args.track_size_in_bytes, \
+    args.band_size_in_tracks, args.cache_percent,

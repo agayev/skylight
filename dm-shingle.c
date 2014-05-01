@@ -8,8 +8,8 @@
 
 struct shingle_c {
   struct dm_dev *dev;
-  int32_t track_size;
-  int32_t band_size;
+  int32_t track_size_in_bytes;
+  int32_t band_size_in_tracks;
   int32_t cache_percent;
 
   /* For debugging. */
@@ -40,13 +40,13 @@ static int shingle_get_args(struct dm_target *ti, struct shingle_c *sc,
     ti->error = "dm-shingle: Invalid track size.";
     return -1;
   }
-  sc->track_size = tmp;
+  sc->track_size_in_bytes = tmp;
 
   if (sscanf(argv[2], "%llu%c", &tmp, &dummy) != 1 || tmp < 20 || tmp > 200) {
     ti->error = "dm-shingle: Invalid band size.";
     return -1;
   }
-  sc->band_size = tmp;
+  sc->band_size_in_tracks = tmp;
 
   if (sscanf(argv[3], "%llu%c", &tmp, &dummy) != 1 || tmp < 1 || tmp > 20) {
     ti->error = "dm-shingle: Invalid cache percent.";
@@ -60,18 +60,35 @@ static int shingle_get_args(struct dm_target *ti, struct shingle_c *sc,
   }
 
   sc->total_size_in_bytes = i_size_read(sc->dev->bdev->bd_inode);
+  sc->band_size_in_bytes = sc->band_size_in_tracks * sc->track_size_in_bytes;
+  sc->num_bands = sc->total_size_in_bytes / sc->band_size_in_bytes;
+  sc->num_cache_bands = sc->num_bands * sc->cache_percent / 100;
+  sc->cache_size_in_bytes = sc->num_cache_bands * sc->band_size_in_bytes;
+
+  /* Make |num_data_bands| a multiple of |num_cache_bands| so that all cache
+   * bands are equally loaded. */
+  sc->num_data_bands = (sc->num_bands / sc->num_cache_bands - 1) *
+                       sc->num_cache_bands;
   
+  sc->data_size_in_bytes = sc->num_data_bands * sc->band_size_in_bytes;
+  sc->wasted_size_in_bytes = sc->total_size_in_bytes -
+                             sc->cache_size_in_bytes -
+                             sc->data_size_in_bytes;
   return 0;
 }
 
 static void shingle_debug_print(struct shingle_c *sc)
 {
   DMERR("Constructing...");
-  DMERR("device: %s", sc->dev->name);
-  DMERR("track size: %d", sc->track_size);
-  DMERR("band size: %d", sc->band_size);
-  DMERR("cache percent: %d", sc->cache_percent);
-  DMERR("Total disk size: %Lu", sc->total_size_in_bytes);
+  DMERR("Device: %s", sc->dev->name);
+  DMERR("Total disk size: %Lu bytes", sc->total_size_in_bytes);
+  DMERR("Band size: %Lu bytes", sc->band_size_in_bytes);
+  DMERR("Total number of bands: %d", sc->num_bands);
+  DMERR("Number of cache bands: %d", sc->num_cache_bands);
+  DMERR("Cache size: %Lu bytes", sc->cache_size_in_bytes);
+  DMERR("Number of data bands: %d", sc->num_data_bands);
+  DMERR("Usable disk size: %Lu bytes", sc->data_size_in_bytes);
+  DMERR("Wasted disk size: %Lu bytes", sc->wasted_size_in_bytes);
 }
 
 static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)

@@ -4,16 +4,14 @@ import argparse
 import os
 import sys
 
-SUFFIXES = {1000: ['KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'],
-            1024: ['KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB']}
+SUFFIXES = ['KiB', 'MiB', 'GiB', 'TiB']
 
-def approximate_size(size, a_kilobyte_is_1024_bytes=True):
+def readable_size(size):
   # Copyright (c) 2009, Mark Pilgrim, All rights reserved.
   assert size >= 0, "Number must be non-negative"
-  multiple = 1024.0 if a_kilobyte_is_1024_bytes else 1000.0
-  for suffix in SUFFIXES[multiple]:
-    size /= multiple
-    if size < multiple:
+  for suffix in SUFFIXES:
+    size /= 1024.0
+    if size < 1024.0:
       return '{0:.1f} {1}'.format(size, suffix)
   assert False
 
@@ -52,23 +50,26 @@ cache_size_in_bytes = num_cache_bands * band_size_in_bytes
 # are equally loaded.
 num_data_bands = (num_bands / num_cache_bands - 1) * num_cache_bands
 data_size_in_bytes = num_data_bands * band_size_in_bytes
+assert data_size_in_bytes % 512 == 0
+num_usable_sectors = data_size_in_bytes / 512
+
 wasted_size_in_bytes = total_size_in_bytes - cache_size_in_bytes - \
     data_size_in_bytes
 
 print '# Total disk size: {} [{} bytes]'. \
-    format(approximate_size(total_size_in_bytes), total_size_in_bytes)
+    format(readable_size(total_size_in_bytes), total_size_in_bytes)
 print '# Band size: {} [{} bytes]'. \
-    format(approximate_size(band_size_in_bytes), band_size_in_bytes)
+    format(readable_size(band_size_in_bytes), band_size_in_bytes)
 print '# Total number of bands: {}'.format(num_bands)
 print '# Number of cache bands: {}'.format(num_cache_bands)
 print '# Cache size: {} [{} bytes]'. \
-    format(approximate_size(cache_size_in_bytes), cache_size_in_bytes)
+    format(readable_size(cache_size_in_bytes), cache_size_in_bytes)
 print '# Number of data bands: {}'.format(num_data_bands)
 print '# Usable disk size: {} [{} bytes]'. \
-    format(approximate_size(data_size_in_bytes), data_size_in_bytes)
-print '# Wasted disk size due to alignment:'. \
-    format(approximate_size(wasted_size_in_bytes), wasted_size_in_bytes)
+    format(readable_size(data_size_in_bytes), data_size_in_bytes)
+print '# Wasted disk size: {} [{} bytes]'. \
+    format(readable_size(wasted_size_in_bytes), wasted_size_in_bytes)
 print
-print 0, data_size_in_bytes, 'shingle', \
+print 0, num_usable_sectors, 'shingle', \
     args.device, args.track_size_in_bytes, \
     args.band_size_in_tracks, args.cache_percent,

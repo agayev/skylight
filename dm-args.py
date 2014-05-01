@@ -55,15 +55,19 @@ data_size_in_bytes = num_data_bands * band_size_in_bytes
 wasted_size_in_bytes = total_size_in_bytes - cache_size_in_bytes - \
     data_size_in_bytes
 
-print '# Total disk size:', approximate_size(total_size_in_bytes)
-print '# Band size:', approximate_size(band_size_in_bytes)
-print '# Total number of bands:', num_bands
-print '# Number of cache bands:', num_cache_bands
-print '# Cache size:', approximate_size(cache_size_in_bytes)
-print '# Number of data bands:', num_data_bands
-print '# Usable disk size:', approximate_size(data_size_in_bytes)
-print '# Wasted disk size due to alignment:', \
-    approximate_size(wasted_size_in_bytes)
+print '# Total disk size: {} [{} bytes]'. \
+    format(approximate_size(total_size_in_bytes), total_size_in_bytes)
+print '# Band size: {} [{} bytes]'. \
+    format(approximate_size(band_size_in_bytes), band_size_in_bytes)
+print '# Total number of bands: {}'.format(num_bands)
+print '# Number of cache bands: {}'.format(num_cache_bands)
+print '# Cache size: {} [{} bytes]'. \
+    format(approximate_size(cache_size_in_bytes), cache_size_in_bytes)
+print '# Number of data bands: {}'.format(num_data_bands)
+print '# Usable disk size: {} [{} bytes]'. \
+    format(approximate_size(data_size_in_bytes), data_size_in_bytes)
+print '# Wasted disk size due to alignment:'. \
+    format(approximate_size(wasted_size_in_bytes), wasted_size_in_bytes)
 print
 print 0, data_size_in_bytes, 'shingle', \
     args.device, args.track_size_in_bytes, \

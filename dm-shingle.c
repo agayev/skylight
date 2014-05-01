@@ -8,9 +8,20 @@
 
 struct shingle_c {
   struct dm_dev *dev;
-  int track_size;
-  int band_size;
-  int cache_percent;
+  int32_t track_size;
+  int32_t band_size;
+  int32_t cache_percent;
+
+  /* For debugging. */
+  int64_t total_size_in_bytes;
+  int64_t cache_size_in_bytes;
+  int64_t band_size_in_bytes;
+  int64_t data_size_in_bytes;
+  int64_t wasted_size_in_bytes;
+  
+  int32_t num_bands;
+  int32_t num_cache_bands;
+  int32_t num_data_bands;
 };
 
 static int shingle_get_args(struct dm_target *ti, struct shingle_c *sc,
@@ -47,6 +58,9 @@ static int shingle_get_args(struct dm_target *ti, struct shingle_c *sc,
     ti->error = "dm-shingle: Device lookup failed.";
     return -1;
   }
+
+  sc->total_size_in_bytes = i_size_read(sc->dev->bdev->bd_inode);
+  
   return 0;
 }
 
@@ -57,6 +71,7 @@ static void shingle_debug_print(struct shingle_c *sc)
   DMERR("track size: %d", sc->track_size);
   DMERR("band size: %d", sc->band_size);
   DMERR("cache percent: %d", sc->cache_percent);
+  DMERR("Total disk size: %Lu", sc->total_size_in_bytes);
 }
 
 static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)

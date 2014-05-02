@@ -6,12 +6,16 @@
 
 #define DM_MSG_PREFIX "shingle"
 
+#define SECTOR_SIZE 4096
+
 struct shingle_c {
   struct dm_dev *dev;
   int32_t track_size_in_bytes;
   int32_t band_size_in_tracks;
   int32_t cache_percent;
-
+  int32_t num_sectors;
+  int32_t *sector_map;
+  
   /* For debugging. */
   int64_t total_size_in_bytes;
   int64_t cache_size_in_bytes;
@@ -59,7 +63,8 @@ static int shingle_get_args(struct dm_target *ti, struct shingle_c *sc,
     return -1;
   }
 
-  sc->total_size_in_bytes = i_size_read(sc->dev->bdev->bd_inode);
+  /* sc->total_size_in_bytes = i_size_read(sc->dev->bdev->bd_inode); */
+  sc->total_size_in_bytes = 350LL << 30;
   sc->band_size_in_bytes = sc->band_size_in_tracks * sc->track_size_in_bytes;
   sc->num_bands = sc->total_size_in_bytes / sc->band_size_in_bytes;
   sc->num_cache_bands = sc->num_bands * sc->cache_percent / 100;
@@ -74,6 +79,13 @@ static int shingle_get_args(struct dm_target *ti, struct shingle_c *sc,
   sc->wasted_size_in_bytes = sc->total_size_in_bytes -
                              sc->cache_size_in_bytes -
                              sc->data_size_in_bytes;
+  sc->num_sectors = sc->data_size_in_bytes / SECTOR_SIZE;
+  
+  if (sc->data_size_in_bytes % SECTOR_SIZE) {
+    ti->error = "dm-shingle: Something wrong with the alignment.";
+    return -1;
+  }
+  
   return 0;
 }
 
@@ -96,7 +108,7 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
   struct shingle_c *sc;
   
   sc = kmalloc(sizeof(*sc), GFP_KERNEL);
-  if (sc == NULL) {
+  if (!sc) {
     ti->error = "dm-shingle: Cannot allocate shingle context.";
     return -ENOMEM;
   }
@@ -106,6 +118,12 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     return -EINVAL;
   }
 
+  sc->sector_map = vmalloc(sizeof(int32_t) * sc->num_sectors);
+  if (!sc->sector_map) {
+    ti->error = "dm-shingle: Cannot allocate sector map.";
+    return -ENOMEM;
+  }
+  
   shingle_debug_print(sc);
   
   ti->num_flush_bios = 1;
@@ -121,6 +139,7 @@ static void shingle_dtr(struct dm_target *ti)
 
   DMERR("Destructing...");
   dm_put_device(ti, sc->dev);
+  vfree(sc->sector_map);
   kfree(sc);
 }
 

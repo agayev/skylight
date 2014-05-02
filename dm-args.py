@@ -39,7 +39,8 @@ assert args.track_size_in_bytes % 4096 == 0 and \
 assert 20 <= args.band_size_in_tracks <= 200, "Invalid band size."
 assert 1 <= args.cache_percent <= 20, "Invalid cache percent."
 
-total_size_in_bytes = device_size(args.device)
+#total_size_in_bytes = device_size(args.device)
+total_size_in_bytes = 350 * 1024 * 1024 * 1024
 band_size_in_bytes = args.band_size_in_tracks * args.track_size_in_bytes
 num_bands = total_size_in_bytes / band_size_in_bytes
 

@@ -36,7 +36,7 @@ struct cache_band {
    * |position = (dbi - start_dbi) / sc->num_cache_bands_|, which is then
    * set. */
   int32_t *bitmap;
-} cache_band;
+};
 
 struct shingle_c {
   char *disk;
@@ -63,7 +63,7 @@ struct shingle_c {
 
   int32_t cache_associativity; /* Number of data bands associated with each
                                 * cache band. */
-} shingle_c;
+};
 
 /* Exported API. */
 void write(struct shingle_c *sc, int32_t sector, char *buf);

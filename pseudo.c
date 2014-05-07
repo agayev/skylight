@@ -214,18 +214,15 @@ void shingle_get_args(struct shingle_c *sc, int argc, char **argv)
   sc->total_size_in_bytes = tmp;
   
   if (sscanf(argv[2], "%llu%c", &tmp, &dummy) != 1 || tmp & 0xfff ||
-      /* TEMPORARY, CHANGE BACK LOWER BOUND TO 512 FOR THE MODULE. */
-      (tmp < 4 * 1024 || tmp > 2 * 1024 * 1024))
+      (tmp < 512 * 1024 || tmp > 2 * 1024 * 1024))
     errx(1, "Invalid track size.");
   sc->track_size_in_bytes = tmp;
 
-  /* TEMPORARY, CHANGE BACK LOWER BOUND TO 20 FOR THE MODULE */
-  if (sscanf(argv[3], "%llu%c", &tmp, &dummy) != 1 || tmp < 1 || tmp > 200)
+  if (sscanf(argv[3], "%llu%c", &tmp, &dummy) != 1 || tmp < 20 || tmp > 200)
     errx(1, "Invalid band size.");
   sc->band_size_in_tracks = tmp;
 
-  /* TEMPORARY, CHANGE BACK UPPER BOUND TO 20 FOR THE MODULE */
-  if (sscanf(argv[4], "%llu%c", &tmp, &dummy) != 1 || tmp < 1 || tmp > 50)
+  if (sscanf(argv[4], "%llu%c", &tmp, &dummy) != 1 || tmp < 1 || tmp > 20)
     errx(1, "Invalid cache percent.");
   sc->cache_percent = tmp;
 }

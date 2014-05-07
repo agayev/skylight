@@ -8,18 +8,23 @@
 #define DM_MSG_PREFIX "shingle"
 
 #define TOTAL_SIZE (76LL << 10)
+
 #define EXTERNAL_SECTOR_SIZE 512
 #define INTERNAL_SECTOR_SIZE 4096
+#define SECTOR_RATIO (INTERNAL_SECTOR_SIZE / EXTERNAL_SECTOR_SIZE)
+
+#define EXT2INT(sector) ((int32_t) (sector / SECTOR_RATIO))
+#define INT2EXT(sector) (((sector_t) sector) * SECTOR_RATIO)
 
 struct cache_band {
-  sector_t begin_sector;    /* Where cache band begins. */
-  sector_t current_sector;  /* Where the next write will go. */
+  int32_t begin_sector;    /* Where cache band begins. */
+  int32_t current_sector;  /* Where the next write will go. */
 
   /* There are usually multiple data bands assigned to each band.
-   * |start_data_band| is the index of the starting data band assigned to this
+   * |begin_data_band| is the index of the first data band assigned to this
    * cache band.  The index of the next data band assigned to this cache band is
-   * |start_data_band + sc->num_cache_bands|.  See below for its use. */
-  int32_t start_data_band;
+   * |begin_data_band + sc->num_cache_bands|.  See below for its use. */
+  int32_t begin_data_band;
 
   /* Although multiple data bands are assigned to a cache band, not all of them
    * may have sectors on the cache band.  |bitmap| keeps track of data bands
@@ -34,7 +39,7 @@ struct cache_band {
    * given data band, its position in the the bitmap is calculated as below, and
    * the bit in that position is set:
    *
-   * |position = (data_band - start_data_band) / sc->num_cache_bands|
+   * |position = (data_band - begin_data_band) / sc->num_cache_bands|
    */
   unsigned long *bitmap;
 };
@@ -165,7 +170,7 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
   sc->num_usable_sectors = sc->usable_size_in_bytes / INTERNAL_SECTOR_SIZE;
   BUG_ON(sc->usable_size_in_bytes % INTERNAL_SECTOR_SIZE);
 
-  sector_map_size = (sizeof(sector_t) * sc->num_usable_sectors);
+  sector_map_size = (sizeof(int32_t) * sc->num_usable_sectors);
   sc->sector_map = vmalloc(sector_map_size);
   BUG_ON(!sc->sector_map);
   memset(sc->sector_map, -1, sector_map_size);
@@ -210,12 +215,86 @@ static void shingle_dtr(struct dm_target *ti)
   kfree(sc);
 }
 
-static sector_t map_sector(struct shingle_c *sc, sector_t sector)
+static int full_cache_band(struct shingle_c *sc, struct cache_band *cb)
 {
-  sector_t mapped_sector;
-  BUG_ON(sector & 0x7);
-  sector /= (INTERNAL_SECTOR_SIZE / EXTERNAL_SECTOR_SIZE);
-  BUG_ON(sector >= sc->num_usable_sectors);
+  return cb->current_sector == cb->begin_sector + sc->band_size_in_sectors;
+}
+
+static int write_to_cache_band(struct shingle_c *sc, struct cache_band *cb,
+                               struct bio *bio)
+{
+  int32_t data_band, data_band_bit;
+  int32_t internal_sector;
+
+  BUG_ON(full_cache_band(sc, cb));
+
+  /* Set the bit for the data band. */
+  internal_sector = EXT2INT(bio->bi_sector);
+  data_band = internal_sector / sc->band_size_in_sectors;
+  BUG_ON(data_band >= sc->num_data_bands);
+  data_band_bit = (data_band - cb->begin_data_band) / sc->num_cache_bands;
+  set_bit(data_band_bit, cb->bitmap);
+  
+  /* Map the sector to a sector in the cache band and start the write. */
+  sc->sector_map[internal_sector] = cb->current_sector++;
+  bio->bi_sector = INT2EXT(sc->sector_map[internal_sector]);
+  bio->bi_bdev = sc->dev->bdev;
+  DMERR("W %d", EXT2INT(bio->bi_sector));
+  return DM_MAPIO_REMAPPED;
+}
+
+/* TODO: Make these reads and writes actually happen. */
+static void read_modify_write_data_band(struct shingle_c *sc, int32_t data_band)
+{
+  int32_t begin_sector = data_band * sc->band_size_in_sectors;
+  int32_t end_sector = begin_sector + sc->band_size_in_sectors;
+
+  int32_t next_sector = begin_sector;
+  for ( ; next_sector < end_sector; ++next_sector)
+    DMERR("R %d", next_sector);
+
+  for (next_sector = begin_sector; next_sector < end_sector; ++next_sector) {
+    if (~sc->sector_map[next_sector]) {
+      DMERR("R %d", sc->sector_map[next_sector]);
+      sc->sector_map[next_sector] = -1;
+    }
+  }
+
+  for (next_sector = begin_sector; next_sector < end_sector; ++next_sector)
+    DMERR("W %d", next_sector);
+}
+
+static void garbage_collect(struct shingle_c *sc, struct cache_band *cb)
+{
+  int bit;
+  for_each_set_bit(bit, cb->bitmap, sc->cache_associativity) {
+    int32_t data_band = bit * sc->num_cache_bands + cb->begin_data_band;
+    DMERR("GC: data band %d has data in the cache buffer.", data_band);
+    read_modify_write_data_band(sc, data_band);
+  }
+  reset_cache_band(sc, cb);
+}
+
+static int write_bio(struct shingle_c *sc, struct bio *bio)
+{
+  int32_t cbi = (EXT2INT(bio->bi_sector) / sc->band_size_in_sectors) %
+                sc->num_cache_bands;
+  struct cache_band *cb = &sc->cache_bands[cbi];
+  if (full_cache_band(sc, cb))
+    garbage_collect(sc, cb);
+  write_to_cache_band(sc, cb, bio);
+  return DM_MAPIO_REMAPPED;
+}
+                          
+static int bad_bio(struct shingle_c *sc, struct bio *bio)
+{
+  return (bio->bi_sector & 0x7) || (bio->bi_size & 0xfff) ||
+      (EXT2INT(bio->bi_sector) >= sc->num_usable_sectors);
+}
+
+static int32_t map_sector(struct shingle_c *sc, int32_t sector)
+{
+  int32_t mapped_sector;
   mapped_sector = sc->sector_map[sector];
   if (!~mapped_sector)
     mapped_sector = sector;
@@ -223,23 +302,26 @@ static sector_t map_sector(struct shingle_c *sc, sector_t sector)
   return mapped_sector;
 }
 
+static int read_bio(struct shingle_c *sc, struct bio *bio)
+{
+  bio->bi_sector = INT2EXT(map_sector(sc, EXT2INT(bio->bi_sector)));
+  bio->bi_bdev = sc->dev->bdev;
+  DMERR("R %d", EXT2INT(bio->bi_sector));
+  return DM_MAPIO_REMAPPED;
+}
+
 static int shingle_map(struct dm_target *ti, struct bio *bio)
 {
   unsigned long flags = bio_rw(bio);
   struct shingle_c *sc = ti->private;
-  BUG_ON(bio->bi_size & 0xfff);
-  
-  if (flags == READ) {
-    bio->bi_sector = map_sector(sc, bio->bi_sector);
-    bio->bi_bdev = sc->dev->bdev;
-    DMERR("READ at %lu of size %u", bio->bi_sector, bio->bi_size);
-    return DM_MAPIO_REMAPPED;
-  }
-  if (flags == READA) {
+
+  BUG_ON(bad_bio(sc, bio));
+  if (flags == READ)
+    return read_bio(sc, bio);
+  if (flags == READA)
     return -EIO;
-  } else if (flags == WRITE) {
-    DMERR("WRITE at %lu of size %u", bio->bi_sector, bio->bi_size);
-  }
+  if (flags == WRITE)
+    return write_bio(sc, bio);
   bio_endio(bio, 0);
   return DM_MAPIO_SUBMITTED;
 }

@@ -18,7 +18,7 @@ struct passthru_c {
   struct dm_dev *dev;
   mempool_t *io_pool;         /* For per bio private data. */
   struct bio_set *bs;         /* For cloned bios. */
-
+  
   struct workqueue_struct *io_queue;
 };
 
@@ -27,7 +27,6 @@ struct passthru_io {
   struct bio *base_bio;
   struct work_struct work;
   int error;
-  sector_t sector;
 };
 
 #define MIN_IOS        16
@@ -40,6 +39,7 @@ static void passthru_dtr(struct dm_target *ti)
 {
   struct passthru_c *pc = (struct passthru_c *) ti->private;
 
+  DMERR("Passthru: destructing...");
   ti->private = NULL;
   if (!pc)
     return;
@@ -62,7 +62,8 @@ static int passthru_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
   struct passthru_c *pc;
   int ret;
-        
+
+  DMERR("Passthru: constructing...");
   if (argc != 1) {
     ti->error = "Invalid argument count";
     return -EINVAL;
@@ -112,15 +113,91 @@ bad:
   return ret;
 }
 
+static struct passthru_io *passthru_io_alloc(struct passthru_c *pc,
+                                             struct bio *bio)
+{
+  struct passthru_io *io;
+
+  io = mempool_alloc(pc->io_pool, GFP_NOIO);
+  io->pc = pc;
+  io->base_bio = bio;
+  
+  return io;
+}
+
+static void passthru_io_release(struct passthru_io *io)
+{
+  struct passthru_c *pc = io->pc;
+  struct bio *base_bio = io->base_bio;
+  int error = io->error;
+
+  mempool_free(io, pc->io_pool);
+  bio_endio(base_bio, error);
+}
+
+static void passthru_endio(struct bio *clone, int error)
+{
+  struct passthru_io *io = clone->bi_private;
+
+  DMERR("<< %c %lu", (bio_data_dir(clone) == READ ? 'R' : 'W'),
+        clone->bi_sector);
+  bio_put(clone);
+  if (unlikely(error))
+    io->error = error;
+  passthru_io_release(io);
+}
+
+static void clone_init(struct passthru_io *io, struct bio *clone)
+{
+  struct passthru_c *pc = io->pc;
+
+  clone->bi_private = io;
+  clone->bi_end_io = passthru_endio;
+  clone->bi_bdev = pc->dev->bdev;
+  clone->bi_rw = io->base_bio->bi_rw;
+}
+
+static void passthrud_io(struct work_struct *work)
+{
+  struct passthru_io *io = container_of(work, struct passthru_io, work);
+  struct passthru_c *pc = io->pc;
+  struct bio *base_bio = io->base_bio;
+  struct bio *clone;
+
+  clone = bio_clone_bioset(base_bio, GFP_NOIO, pc->bs);
+  if (!clone) {
+    io->error = -ENOMEM;
+    passthru_io_release(io);
+    return;
+  }
+
+  clone_init(io, clone);
+  generic_make_request(clone);
+}
+
+static void passthru_queue_io(struct passthru_io *io)
+{
+  struct passthru_c *pc = io->pc;
+
+  INIT_WORK(&io->work, passthrud_io);
+  queue_work(pc->io_queue, &io->work);
+}
+
 static int passthru_map(struct dm_target *ti, struct bio *bio)
 {
+  struct passthru_io *io;
+  struct passthru_c *pc = ti->private;
+
+  DMERR(">> %c %lu", (bio_data_dir(bio) == READ ? 'R' : 'W'), bio->bi_sector);
+  io = passthru_io_alloc(pc, bio);
+  passthru_queue_io(io);
   return DM_MAPIO_REMAPPED;
 }
 
 static void passthru_status(struct dm_target *ti, status_type_t type,
                             unsigned status_flags, char *result, unsigned maxlen)
 {
-  struct passthru_c *lc = (struct passthru_c *) ti->private;
+  struct passthru_c *pc = (struct passthru_c *) ti->private;
 
   switch (type) {
     case STATUSTYPE_INFO:
@@ -128,7 +205,7 @@ static void passthru_status(struct dm_target *ti, status_type_t type,
       break;
 
     case STATUSTYPE_TABLE:
-      snprintf(result, maxlen, "%s", lc->dev->name);
+      snprintf(result, maxlen, "%s", pc->dev->name);
       break;
   }
 }
@@ -145,10 +222,18 @@ static struct target_type passthru_target = {
 
 int __init dm_passthru_init(void)
 {
-  int r = dm_register_target(&passthru_target);
+  int r;
+  
+  _passthru_io_pool = KMEM_CACHE(passthru_io, 0);
+  if (!_passthru_io_pool)
+    return -ENOMEM;
+  
+  r = dm_register_target(&passthru_target);
 
-  if (r < 0)
+  if (r < 0) {
     DMERR("register failed %d", r);
+    kmem_cache_destroy(_passthru_io_pool);
+  }
 
   return r;
 }

@@ -121,6 +121,7 @@ static struct passthru_io *passthru_io_alloc(struct passthru_c *pc,
   io = mempool_alloc(pc->io_pool, GFP_NOIO);
   io->pc = pc;
   io->base_bio = bio;
+  io->error = 0;
   
   return io;
 }
@@ -139,11 +140,15 @@ static void passthru_endio(struct bio *clone, int error)
 {
   struct passthru_io *io = clone->bi_private;
 
-  DMERR("<< %c %lu", (bio_data_dir(clone) == READ ? 'R' : 'W'),
+  if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
+    io->error = -EIO;
+
+  DMERR("%s %c %lu",
+        (io->error ? "!!" : "OK"),
+        (bio_data_dir(clone) == READ ? 'R' : 'W'),
         clone->bi_sector);
+  
   bio_put(clone);
-  if (unlikely(error))
-    io->error = error;
   passthru_io_release(io);
 }
 
@@ -154,7 +159,6 @@ static void clone_init(struct passthru_io *io, struct bio *clone)
   clone->bi_private = io;
   clone->bi_end_io = passthru_endio;
   clone->bi_bdev = pc->dev->bdev;
-  clone->bi_rw = io->base_bio->bi_rw;
 }
 
 static void passthrud_io(struct work_struct *work)
@@ -188,10 +192,9 @@ static int passthru_map(struct dm_target *ti, struct bio *bio)
   struct passthru_io *io;
   struct passthru_c *pc = ti->private;
 
-  DMERR(">> %c %lu", (bio_data_dir(bio) == READ ? 'R' : 'W'), bio->bi_sector);
   io = passthru_io_alloc(pc, bio);
   passthru_queue_io(io);
-  return DM_MAPIO_REMAPPED;
+  return DM_MAPIO_SUBMITTED;
 }
 
 static void passthru_status(struct dm_target *ti, status_type_t type,

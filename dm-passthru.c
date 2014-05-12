@@ -206,13 +206,13 @@ static void passthru_status(struct dm_target *ti, status_type_t type,
         struct passthru_c *pc = (struct passthru_c *) ti->private;
 
         switch (type) {
-                case STATUSTYPE_INFO:
-                        result[0] = '\0';
-                        break;
+        case STATUSTYPE_INFO:
+                result[0] = '\0';
+                break;
 
-                case STATUSTYPE_TABLE:
-                        snprintf(result, maxlen, "%s", pc->dev->name);
-                        break;
+        case STATUSTYPE_TABLE:
+                snprintf(result, maxlen, "%s", pc->dev->name);
+                break;
         }
 }
 

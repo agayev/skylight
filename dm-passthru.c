@@ -27,6 +27,7 @@ struct passthru_io {
   struct bio *base_bio;
   struct work_struct work;
   int error;
+  atomic_t io_pending;
 };
 
 #define MIN_IOS        16
@@ -122,6 +123,7 @@ static struct passthru_io *passthru_io_alloc(struct passthru_c *pc,
   io->pc = pc;
   io->base_bio = bio;
   io->error = 0;
+  atomic_set(&io->io_pending, 1);
   
   return io;
 }
@@ -132,6 +134,7 @@ static void passthru_io_release(struct passthru_io *io)
   struct bio *base_bio = io->base_bio;
   int error = io->error;
 
+  BUG_ON(!atomic_dec_and_test(io->io_pending));
   mempool_free(io, pc->io_pool);
   bio_endio(base_bio, error);
 }

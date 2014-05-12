@@ -101,16 +101,16 @@ struct cache_band {
 };
 
 /*
- * This represents a single I/O operation, either read or write.  The |base_bio|
+ * This represents a single I/O operation, either read or write.  The |bio|
  * associated with it may result in multiple bios being generated, all of which
  * should completed before this one can be considered completed.  Every
  * generated bio increments |pending| and every completed bio decrements
  * pending.  When |pending| reaches zero, we deallocate |io| and signal the
- * completion of |base_bio| by calling |bio_endio| on it.
+ * completion of |bio| by calling |bio_endio| on it.
  */
 struct io {
         struct shingle_c *sc;
-        struct bio *base_bio;
+        struct bio *bio;
         struct work_struct work;
         int error;
         atomic_t pending;
@@ -121,31 +121,31 @@ struct io {
 
 static struct kmem_cache *_io_pool;
 
-static struct io *io_alloc(struct shingle_c *sc, struct bio *bio)
+static struct io *alloc_io(struct shingle_c *sc, struct bio *bio)
 {
         struct io *io = mempool_alloc(sc->io_pool, GFP_NOIO);
         
         io->sc = sc;
-        io->base_bio = bio;
+        io->bio = bio;
         io->error = 0;
-        atomic_set(&io->pending, 1);
+        atomic_set(&io->pending, 0);
 
         return io;
 }
 
-static void io_release(struct io *io)
+static void release_io(struct io *io)
 {
         struct shingle_c *sc = io->sc;
-        struct bio *base_bio = io->base_bio;
+        struct bio *bio = io->bio;
         int error = io->error;
 
-        BUG_ON(!atomic_dec_and_test(&io->pending));
+        BUG_ON(atomic_read(&io->pending));
         mempool_free(io, sc->io_pool);
-        bio_endio(base_bio, error);
+        bio_endio(bio, error);
 }
 
-static bool shingle_get_args(struct dm_target *ti, struct shingle_c *sc,
-                             int argc, char **argv)
+static bool get_args(struct dm_target *ti, struct shingle_c *sc,
+                     int argc, char **argv)
 {
         unsigned long long tmp;
         char dummy;
@@ -177,7 +177,7 @@ static bool shingle_get_args(struct dm_target *ti, struct shingle_c *sc,
         return true;
 }
 
-static void shingle_debug_print(struct shingle_c *sc)
+static void debug_print(struct shingle_c *sc)
 {
         DMERR("Constructing...");
         DMERR("Device: %s", sc->dev->name);
@@ -273,7 +273,7 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         }
         ti->private = sc;
 
-        if (!shingle_get_args(ti, sc, argc, argv)) {
+        if (!get_args(ti, sc, argc, argv)) {
                 kfree(sc);
                 return -EINVAL;
         }
@@ -312,7 +312,7 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
                 return -1;
         }
         
-        shingle_debug_print(sc);
+        debug_print(sc);
   
         ti->num_flush_bios = 1;
         ti->num_discard_bios = 1;
@@ -358,68 +358,35 @@ static int full_cache_band(struct shingle_c *sc, struct cache_band *cb)
         return cb->current_sector == cb->begin_sector + sc->band_size_sectors;
 }
 
-static int write_to_cache_band(struct shingle_c *sc, struct cache_band *cb,
-                               struct bio *bio)
+static void write_cache_band(struct shingle_c *sc, struct cache_band *cb,
+                             struct bio *clone)
 {
-        int32_t db, pos, sector;
-
-        BUG_ON(full_cache_band(sc, cb));
-
-        /* Set the bit for the data band. */
-        sector = EXT2INT(bio->bi_sector);
-        db = sector / sc->band_size_sectors;
-        BUG_ON(db >= sc->num_data_bands);
-        pos = (db - cb->begin_data_band) / sc->num_cache_bands;
-        set_bit(pos, cb->data_band_bitmap);
-  
-        /* Map the sector to a sector in the cache band and start the write. */
-        sc->sector_map[sector] = cb->current_sector++;
-        bio->bi_sector = INT2EXT(sc->sector_map[sector]);
-        bio->bi_bdev = sc->dev->bdev;
-        DMERR("W %d", EXT2INT(bio->bi_sector));
-        return DM_MAPIO_REMAPPED;
-}
-
-/* TODO: Make these reads and writes actually happen. */
-static void read_modify_write_data_band(struct shingle_c *sc, int32_t db)
-{
-        int32_t begin_sector = db * sc->band_size_sectors;
-        int32_t end_sector = begin_sector + sc->band_size_sectors;
-        int32_t i;
+        int32_t internal_sector = EXT2INT(clone->bi_sector);
+        int32_t db = internal_sector / sc->band_size_sectors;
+        int32_t pos = (db - cb->begin_data_band) / sc->num_cache_bands;
         
-        for (i = begin_sector; i < end_sector; ++i)
-                DMERR("R %d", i);
+        BUG_ON(full_cache_band(sc, cb));
+        BUG_ON(db >= sc->num_data_bands);
 
-        for (i = begin_sector; i < end_sector; ++i) {
-                if (~sc->sector_map[i]) {
-                        DMERR("R %d", sc->sector_map[i]);
-                        sc->sector_map[i] = -1;
-                }
-        }
-        for (i = begin_sector; i < end_sector; ++i)
-                DMERR("W %d", i);
+        set_bit(pos, cb->data_band_bitmap);
+
+        sc->sector_map[internal_sector] = cb->current_sector++;
+        clone->bi_sector = INT2EXT(sc->sector_map[internal_sector]);
+        clone->bi_bdev = sc->dev->bdev;
+        
+        generic_make_request(clone);
 }
 
-static void garbage_collect(struct shingle_c *sc, struct cache_band *cb)
+static void gc_cache_band(struct shingle_c *sc, struct cache_band *cb)
 {
-        int i;
-        for_each_set_bit(i, cb->data_band_bitmap, sc->cache_assoc) {
-                int32_t db = i * sc->num_cache_bands + cb->begin_data_band;
-                DMERR("GC: data band %d has data in the cache buffer.", db);
-                read_modify_write_data_band(sc, db);
-        }
-        reset_cache_band(sc, cb);
-}
-
-static int write_bio(struct shingle_c *sc, struct bio *bio)
-{
-        int32_t i = (EXT2INT(bio->bi_sector) / sc->band_size_sectors) %
-                sc->num_cache_bands;
-        struct cache_band *cb = &sc->cache_bands[i];
-        if (full_cache_band(sc, cb))
-                garbage_collect(sc, cb);
-        write_to_cache_band(sc, cb, bio);
-        return DM_MAPIO_REMAPPED;
+        BUG();
+        /* int i; */
+        /* for_each_set_bit(i, cb->data_band_bitmap, sc->cache_assoc) { */
+        /*         int32_t db = i * sc->num_cache_bands + cb->begin_data_band; */
+        /*         DMERR("GC: data band %d has data in the cache buffer.", db); */
+        /*         read_modify_write_data_band(sc, db); */
+        /* } */
+        /* reset_cache_band(sc, cb); */
 }
                           
 static int bad_bio(struct shingle_c *sc, struct bio *bio)
@@ -428,21 +395,14 @@ static int bad_bio(struct shingle_c *sc, struct bio *bio)
                 (EXT2INT(bio->bi_sector) >= sc->num_usable_sectors);
 }
 
-static int32_t map_sector(struct shingle_c *sc, int32_t sector)
+static sector_t map_sector(struct shingle_c *sc, sector_t sector)
 {
-        int32_t mapped_sector = sc->sector_map[sector];
+        int32_t internal_sector = EXT2INT(sector);
+        int32_t mapped_sector = sc->sector_map[internal_sector];
         if (!~mapped_sector)
-                mapped_sector = sector;
+                mapped_sector = internal_sector;
         BUG_ON(mapped_sector >= sc->num_valid_sectors);
-        return mapped_sector;
-}
-
-static int read_bio(struct shingle_c *sc, struct bio *bio)
-{
-        bio->bi_sector = INT2EXT(map_sector(sc, EXT2INT(bio->bi_sector)));
-        bio->bi_bdev = sc->dev->bdev;
-        DMERR("R %d", EXT2INT(bio->bi_sector));
-        return DM_MAPIO_REMAPPED;
+        return INT2EXT(mapped_sector);
 }
 
 static void endio(struct bio *clone, int error)
@@ -458,16 +418,62 @@ static void endio(struct bio *clone, int error)
               clone->bi_sector);
 
         bio_put(clone);
-        io_release(io);
+        if (atomic_dec_and_test(&io->pending))
+                release_io(io);
 }
 
 static void clone_init(struct io *io, struct bio *clone)
 {
         struct shingle_c *sc = io->sc;
 
+        atomic_inc(&io->pending);
         clone->bi_private = io;
         clone->bi_end_io = endio;
         clone->bi_bdev = sc->dev->bdev;
+}
+
+static struct cache_band *get_cache_band(struct shingle_c *sc, struct bio *bio)
+{
+        int32_t internal_sector = EXT2INT(bio->bi_sector);
+        int32_t cbi = (internal_sector / sc->band_size_sectors) %
+                      sc->num_cache_bands;
+        return &sc->cache_bands[cbi];
+}
+
+static void read_io(struct io *io)
+{
+        struct shingle_c *sc = io->sc;
+        struct bio *bio = io->bio;
+        struct bio *clone = bio_clone_bioset(bio, GFP_NOIO, sc->bs);
+
+        if (!clone) {
+                io->error = -ENOMEM;
+                release_io(io);
+                return;
+        }
+        clone_init(io, clone);
+        clone->bi_sector = map_sector(sc, clone->bi_sector);
+        clone->bi_bdev = sc->dev->bdev;
+        generic_make_request(clone);
+}
+
+static void write_io(struct io *io)
+{
+        struct shingle_c *sc = io->sc;
+        struct bio *bio = io->bio;
+        struct bio *clone = bio_clone_bioset(bio, GFP_NOIO, sc->bs);
+        struct cache_band *cb = get_cache_band(sc, bio);
+
+        if (!clone) {
+                io->error = -ENOMEM;
+                release_io(io);
+                return;
+        }
+        clone_init(io, clone);
+        
+        if (full_cache_band(sc, cb))
+                gc_cache_band(sc, cb);
+        write_cache_band(sc, cb, clone);
 }
 
 /*
@@ -476,18 +482,11 @@ static void clone_init(struct io *io, struct bio *clone)
 static void shingled(struct work_struct *work)
 {
         struct io *io = container_of(work, struct io, work);
-        struct shingle_c *sc = io->sc;
-        struct bio *base_bio = io->base_bio;
-        struct bio *clone = bio_clone_bioset(base_bio, GFP_NOIO, sc->bs);
 
-        if (!clone) {
-                io->error = -ENOMEM;
-                io_release(io);
-                return;
-        }
-        
-        clone_init(io, clone);
-        generic_make_request(clone);
+        if (bio_data_dir(io->bio) == READ)
+                read_io(io);
+        else
+                write_io(io);
 }
 
 static void queue_io(struct io *io)
@@ -503,7 +502,7 @@ static int shingle_map(struct dm_target *ti, struct bio *bio)
 {
         unsigned long flags = bio_rw(bio);
         struct shingle_c *sc = ti->private;
-        struct io *io = io_alloc(sc, bio);
+        struct io *io = alloc_io(sc, bio);
         
         BUG_ON(bad_bio(sc, bio));
         switch (flags) {

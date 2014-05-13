@@ -453,12 +453,19 @@ static struct cache_band *get_cache_band(struct shingle_c *sc, struct bio *bio)
         return &sc->cache_bands[cbi];
 }
 
+static bool single_segment(struct bio *bio)
+{
+        return bio->bi_vcnt == 1 && bio->bi_size == PAGE_SIZE ;
+}
+
 static void read_io(struct io *io)
 {
         struct shingle_c *sc = io->sc;
         struct bio *bio = io->bio;
         struct bio *clone = bio_clone_bioset(bio, GFP_NOIO, sc->bs);
 
+        BUG_ON(single_segment(bio));
+        
         if (!clone) {
                 io->error = -ENOMEM;
                 release_io(io);
@@ -517,18 +524,18 @@ static void queue_io(struct io *io)
         
 }
 
-static bool single_segment(struct bio *bio)
-{
-        return bio->bi_vcnt == 1 && bio->bi_size == PAGE_SIZE ;
-}
-
 static int shingle_map(struct dm_target *ti, struct bio *bio)
 {
         struct shingle_c *sc = ti->private;
         struct cache_band *cb;
          
         BUG_ON(bad_bio(sc, bio));
-        
+
+        /*
+         * TODO: It is possible that even a multi-segment bio can proceed just
+         * after a simple remap.  Handle that as well, in which case
+         * single-segment I/O will become a special case of that.
+         */
         if (single_segment(bio)) {
                 if (bio_data_dir(bio) == READ) {
                         bio->bi_sector = lookup_sector(sc, bio->bi_sector);

@@ -13,12 +13,14 @@
 
 #define TOTAL_SIZE (76LL << 10)
 
-#define EXT_SECTOR_SIZE 512
-#define INT_SECTOR_SIZE 4096
-#define SECTOR_SIZE_RATIO (INT_SECTOR_SIZE / EXT_SECTOR_SIZE)
+#define LBA_SIZE 512
+#define PBA_SIZE 4096
+#define SIZE_RATIO (PBA_SIZE / LBA_SIZE)
 
-#define EXT2INT(sector) ((int32_t) (sector / SECTOR_SIZE_RATIO))
-#define INT2EXT(sector) (((sector_t) sector) * SECTOR_SIZE_RATIO)
+#define LBA_TO_PBA(lba) ((int32_t) (lba / SIZE_RATIO))
+#define PBA_TO_LBA(pba) (((sector_t) pba) * SIZE_RATIO)
+
+#define NUM_LBAS_PER_PAGE (PAGE_SIZE / LBA_SIZE)
 
 struct shingle_c {
         struct dm_dev *dev;
@@ -37,17 +39,17 @@ struct shingle_c {
         int32_t track_size;
         int64_t band_size;
         int32_t band_size_tracks;
-        int32_t band_size_sectors;
+        int32_t band_size_pbas;
 
-        /* Number of valid sectors.  Includes the cache region. */
-        int32_t num_valid_sectors;
+        /* Number of valid pbas.  Includes the cache region. */
+        int32_t num_valid_pbas;
 
-        /* Number of usable sectors.  Excludes the cache region. */
-        int32_t num_usable_sectors;
+        /* Number of usable pbas.  Excludes the cache region. */
+        int32_t num_usable_pbas;
 
-        /* Maps a sector to its location in the cache region.  Contains -1 for
-         * unmapped sectors. */
-        int32_t *sector_map;
+        /* Maps a pba to its location in the cache region.  Contains -1 for
+         * unmapped pbas. */
+        int32_t *pba_map;
         
         struct cache_band *cache_bands;
 
@@ -69,8 +71,8 @@ struct shingle_c {
 };
 
 struct cache_band {
-        int32_t begin_sector;   /* Where the cache band begins. */
-        int32_t current_sector; /* Where the next write will go. */
+        int32_t begin_pba;   /* Where the cache band begins. */
+        int32_t current_pba; /* Where the next write will go. */
 
         /*
          * There are usually multiple data bands assigned to each band.
@@ -82,15 +84,15 @@ struct cache_band {
 
         /*
          * Although multiple data bands are assigned to a cache band, not all of
-         * them may have sectors on it.  |data_band_bitmap| keeps track of data
-         * bands having sectors on this cache band.  This is used during garbage
+         * them may have pbas on it.  |data_band_bitmap| keeps track of data
+         * bands having pbas on this cache band.  This is used during garbage
          * collection.
          *
          * Assume there are 6 data bands and 2 cache bands.  Then data bands 0,
          * 2, 4 are assigned to cache band 0 and data bands 1, 3, 5 are assigned
          * to cache band 1 (using modulo arithmetic).  Consider cache band 1.
-         * If it contains sectors only for data band 5, then |data_band_bitmap|
-         * will be "001", if it contains sectors for data bands 1 and 3, then
+         * If it contains pbas only for data band 5, then |data_band_bitmap|
+         * will be "001", if it contains pbas for data bands 1 and 3, then
          * |data_band_bitmap| will be "110".  That is, a given data band, its
          * position in the the bitmap is calculated as below, and the bit in
          * that position is set:
@@ -183,20 +185,20 @@ static void debug_print(struct shingle_c *sc)
         DMERR("Device: %s", sc->dev->name);
         DMERR("Total disk size: %Lu bytes", sc->total_size);
         DMERR("Band size: %Lu bytes", sc->band_size);
-        DMERR("Band size: %d sectors", sc->band_size_sectors);
+        DMERR("Band size: %d pbas", sc->band_size_pbas);
         DMERR("Total number of bands: %d", sc->num_bands);
         DMERR("Number of cache bands: %d", sc->num_cache_bands);
         DMERR("Cache size: %Lu bytes", sc->cache_size);
         DMERR("Number of data bands: %d", sc->num_data_bands);
         DMERR("Usable disk size: %Lu bytes", sc->usable_size);
-        DMERR("Number of usable sectors: %d", sc->num_usable_sectors);
+        DMERR("Number of usable pbas: %d", sc->num_usable_pbas);
         DMERR("Wasted disk size: %Lu bytes", sc->wasted_size);
 }
 
 static void reset_cache_band(struct shingle_c *sc, struct cache_band *cb)
 {
         BUG_ON(!sc || !cb);
-        cb->current_sector = cb->begin_sector;
+        cb->current_pba = cb->begin_pba;
         bitmap_zero(cb->data_band_bitmap, sc->cache_assoc);
 }
 
@@ -204,7 +206,7 @@ static void calc_params(struct shingle_c *sc)
 {
         sc->total_size = TOTAL_SIZE; /* i_size_read(sc->dev->bdev->bd_inode); */
         sc->band_size = sc->band_size_tracks * sc->track_size;
-        sc->band_size_sectors = sc->band_size / INT_SECTOR_SIZE;
+        sc->band_size_pbas = sc->band_size / PBA_SIZE;
         sc->num_bands = sc->total_size / sc->band_size;
         sc->num_cache_bands = sc->num_bands * sc->cache_percent / 100;
         sc->cache_size = sc->num_cache_bands * sc->band_size;
@@ -217,31 +219,28 @@ static void calc_params(struct shingle_c *sc)
         sc->cache_assoc = sc->num_data_bands / sc->num_cache_bands;
         sc->usable_size = sc->num_data_bands * sc->band_size;
         sc->wasted_size = sc->total_size - sc->cache_size - sc->usable_size;
-        
-        sc->num_valid_sectors =
-                (sc->usable_size + sc->cache_size) / INT_SECTOR_SIZE;
-        
-        sc->num_usable_sectors = sc->usable_size / INT_SECTOR_SIZE;
-        BUG_ON(sc->usable_size % INT_SECTOR_SIZE);
+        sc->num_valid_pbas = (sc->usable_size + sc->cache_size) / PBA_SIZE;
+        sc->num_usable_pbas = sc->usable_size / PBA_SIZE;
+        BUG_ON(sc->usable_size % PBA_SIZE);
 }
 
 static bool alloc_structs(struct shingle_c *sc)
 {
-        int32_t i, size, sector;
+        int32_t i, size, pba;
 
-        size = sizeof(int32_t) * sc->num_usable_sectors;
-        sc->sector_map = vmalloc(size);
-        if (!sc->sector_map)
+        size = sizeof(int32_t) * sc->num_usable_pbas;
+        sc->pba_map = vmalloc(size);
+        if (!sc->pba_map)
                 return false;
-        memset(sc->sector_map, -1, size);
+        memset(sc->pba_map, -1, size);
 
         size = sizeof(struct cache_band) * sc->num_cache_bands;
         sc->cache_bands = vmalloc(size);
         if (!sc->cache_bands)
                 return false;
 
-        /* The first sector of the cache region is |sc->num_usable_sectors|. */
-        sector = sc->num_usable_sectors;
+        /* The first pba of the cache region is |sc->num_usable_pbas|. */
+        pba = sc->num_usable_pbas;
         size = BITS_TO_LONGS(sc->cache_assoc) * sizeof(long);
         for (i = 0; i < sc->num_cache_bands; ++i) {
                 unsigned long *bitmap = kmalloc(size, GFP_KERNEL);
@@ -249,9 +248,9 @@ static bool alloc_structs(struct shingle_c *sc)
                         return false;
                 sc->cache_bands[i].data_band_bitmap = bitmap;
                 
-                sc->cache_bands[i].begin_sector = sector;
+                sc->cache_bands[i].begin_pba = pba;
                 reset_cache_band(sc, &sc->cache_bands[i]);
-                sector += sc->band_size_sectors;
+                pba += sc->band_size_pbas;
         }
         return true;
 }
@@ -345,8 +344,8 @@ static void shingle_dtr(struct dm_target *ti)
                 if (sc->cache_bands[i].data_band_bitmap)
                         kfree(sc->cache_bands[i].data_band_bitmap);
 
-        if (sc->sector_map)
-                vfree(sc->sector_map);
+        if (sc->pba_map)
+                vfree(sc->pba_map);
         if (sc->cache_bands)
                 vfree(sc->cache_bands);
         kfree(sc);
@@ -354,7 +353,7 @@ static void shingle_dtr(struct dm_target *ti)
 
 static int full_cache_band(struct shingle_c *sc, struct cache_band *cb)
 {
-        return cb->current_sector == cb->begin_sector + sc->band_size_sectors;
+        return cb->current_pba == cb->begin_pba + sc->band_size_pbas;
 }
 
 static void gc_cache_band(struct shingle_c *sc, struct cache_band *cb)
@@ -376,46 +375,46 @@ static int bad_bio(struct shingle_c *sc, struct bio *bio)
 {
         DMERR("%lx", bio->bi_rw);
         return (bio->bi_sector & 0x7) || (bio->bi_size & 0xfff) ||
-                        (EXT2INT(bio->bi_sector) >= sc->num_usable_sectors);
+                        (LBA_TO_PBA(bio->bi_sector) >= sc->num_usable_pbas);
 }
 
 /*
- * Looks up |sector| in the |sector_map|.  Returns the |sector| if it does not
- * exist in the sector map.
+ * Translates |lba| to its physical location on disk.  Returns |lba| if it was
+ * not mapped.
  */
-static sector_t lookup_sector(struct shingle_c *sc, sector_t sector)
+static sector_t lookup_lba(struct shingle_c *sc, sector_t lba)
 {
-        int32_t internal_sector = EXT2INT(sector);
-        int32_t xlated_sector = sc->sector_map[internal_sector];
+        int32_t pba = LBA_TO_PBA(lba);
+        int32_t mapped_pba = sc->pba_map[pba];
         
-        BUG_ON(xlated_sector >= sc->num_valid_sectors);
+        BUG_ON(mapped_pba >= sc->num_valid_pbas);
         
-        if (!~xlated_sector)
-                xlated_sector = internal_sector;
+        if (!~mapped_pba)
+                mapped_pba = pba;
 
-        return INT2EXT(xlated_sector);
+        return PBA_TO_LBA(mapped_pba);
 }
 
 /*
- * Maps |sector| to a sector in the cache band.  Also sets the bit for the data
- * band to which |sector| belongs.
+ * Maps |lba| to an lba in the cache band.  Also sets the bit for the data band
+ * to which |lba| belongs.
  */
-static sector_t map_sector(struct shingle_c *sc, struct cache_band *cb,
-                           sector_t sector)
+static sector_t map_lba(struct shingle_c *sc, struct cache_band *cb,
+                        sector_t lba)
 {
-        int32_t internal_sector = EXT2INT(sector);
-        int32_t data_band = internal_sector / sc->band_size_sectors;
+        int32_t pba = LBA_TO_PBA(lba);
+        int32_t data_band = pba / sc->band_size_pbas;
         int32_t pos = (data_band - cb->begin_data_band) / sc->num_cache_bands;
-        int32_t mapped_sector = cb->current_sector++;
+        int32_t mapped_pba = cb->current_pba++;
 
-        BUG_ON(mapped_sector >= sc->num_valid_sectors);
+        BUG_ON(mapped_pba >= sc->num_valid_pbas);
         BUG_ON(full_cache_band(sc, cb));
         BUG_ON(data_band >= sc->num_data_bands);
 
         set_bit(pos, cb->data_band_bitmap);
-        sc->sector_map[internal_sector] = mapped_sector;
+        sc->pba_map[pba] = mapped_pba;
 
-        return INT2EXT(mapped_sector);
+        return PBA_TO_LBA(mapped_pba);
 }
 
 static void endio(struct bio *clone, int error)
@@ -447,8 +446,8 @@ static void clone_init(struct io *io, struct bio *clone)
 
 static struct cache_band *get_cache_band(struct shingle_c *sc, struct bio *bio)
 {
-        int32_t internal_sector = EXT2INT(bio->bi_sector);
-        int32_t cbi = (internal_sector / sc->band_size_sectors) %
+        int32_t pba = LBA_TO_PBA(bio->bi_sector);
+        int32_t cbi = (pba / sc->band_size_pbas) %
                       sc->num_cache_bands;
         return &sc->cache_bands[cbi];
 }
@@ -462,18 +461,32 @@ static void read_io(struct io *io)
 {
         struct shingle_c *sc = io->sc;
         struct bio *bio = io->bio;
-        struct bio *clone = bio_clone_bioset(bio, GFP_NOIO, sc->bs);
+        struct bio *clone;
+        /* struct bio_vec *bv; */
+        /* sector_t last_sector, last_xlated_sector; */
+        /* int i; */
 
         BUG_ON(single_segment(bio));
-        
+
+        clone = bio_clone_bioset(bio, GFP_NOIO, sc->bs);
         if (!clone) {
                 io->error = -ENOMEM;
                 release_io(io);
                 return;
         }
-        
         clone_init(io, clone);
-        clone->bi_sector = lookup_sector(sc, clone->bi_sector);
+
+        /* last_sector = clone->bi_sector; */
+        /* last_xlated_sector = lookup_sector(last_sector); */
+        /* ++clone->bi_idx; */
+        
+        /* bio_for_each_segment(bv, clone, i) { */
+        /*         sector_t xlated_sector = lookup_sector(sc, last_sector); */
+        /*         if () { */
+        /*         } */
+        /*         last_sector +=  */
+
+        clone->bi_sector = lookup_lba(sc, clone->bi_sector);
         clone->bi_bdev = sc->dev->bdev;
         
         generic_make_request(clone);
@@ -496,7 +509,7 @@ static void write_io(struct io *io)
                 gc_cache_band(sc, cb);
 
         clone_init(io, clone);
-        clone->bi_sector = map_sector(sc, cb, clone->bi_sector);
+        clone->bi_sector = map_lba(sc, cb, clone->bi_sector);
         clone->bi_bdev = sc->dev->bdev;
 
         generic_make_request(clone);
@@ -538,7 +551,7 @@ static int shingle_map(struct dm_target *ti, struct bio *bio)
          */
         if (single_segment(bio)) {
                 if (bio_data_dir(bio) == READ) {
-                        bio->bi_sector = lookup_sector(sc, bio->bi_sector);
+                        bio->bi_sector = lookup_lba(sc, bio->bi_sector);
                         bio->bi_bdev = sc->dev->bdev;
                         DMERR("0 R %lu", bio->bi_sector);
                         return DM_MAPIO_REMAPPED;
@@ -546,7 +559,7 @@ static int shingle_map(struct dm_target *ti, struct bio *bio)
                 
                 cb = get_cache_band(sc, bio);
                 if (!full_cache_band(sc, cb)) {
-                        bio->bi_sector = map_sector(sc, cb, bio->bi_sector);
+                        bio->bi_sector = map_lba(sc, cb, bio->bi_sector);
                         bio->bi_bdev = sc->dev->bdev;
                         DMERR("0 W %lu", bio->bi_sector);
                         return DM_MAPIO_REMAPPED;

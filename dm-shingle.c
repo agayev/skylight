@@ -227,25 +227,24 @@ static void calc_params(struct shingle_c *sc)
 
 static bool alloc_structs(struct shingle_c *sc)
 {
-        struct cache_band *cb;
-        int32_t i, sector;
-        int32_t sector_map_size = sizeof(int32_t) * sc->num_usable_sectors;
-        int32_t cache_bands_size = sizeof(*cb) * sc->num_cache_bands;
-        int32_t bitmap_size = BITS_TO_LONGS(sc->cache_assoc) * sizeof(long);
+        int32_t i, size, sector;
 
-        sc->sector_map = vmalloc(sector_map_size);
+        size = sizeof(int32_t) * sc->num_usable_sectors;
+        sc->sector_map = vmalloc(size);
         if (!sc->sector_map)
                 return false;
-        memset(sc->sector_map, -1, sector_map_size);
+        memset(sc->sector_map, -1, size);
 
-        sc->cache_bands = vmalloc(cache_bands_size);
+        size = sizeof(struct cache_band) * sc->num_cache_bands;
+        sc->cache_bands = vmalloc(size);
         if (!sc->cache_bands)
                 return false;
 
         /* The first sector of the cache region is |sc->num_usable_sectors|. */
         sector = sc->num_usable_sectors;
+        size = BITS_TO_LONGS(sc->cache_assoc) * sizeof(long);
         for (i = 0; i < sc->num_cache_bands; ++i) {
-                unsigned long *bitmap = kmalloc(bitmap_size, GFP_KERNEL);
+                unsigned long *bitmap = kmalloc(size, GFP_KERNEL);
                 if (!bitmap)
                         return false;
                 sc->cache_bands[i].data_band_bitmap = bitmap;
@@ -358,25 +357,6 @@ static int full_cache_band(struct shingle_c *sc, struct cache_band *cb)
         return cb->current_sector == cb->begin_sector + sc->band_size_sectors;
 }
 
-static void write_cache_band(struct shingle_c *sc, struct cache_band *cb,
-                             struct bio *clone)
-{
-        int32_t internal_sector = EXT2INT(clone->bi_sector);
-        int32_t db = internal_sector / sc->band_size_sectors;
-        int32_t pos = (db - cb->begin_data_band) / sc->num_cache_bands;
-        
-        BUG_ON(full_cache_band(sc, cb));
-        BUG_ON(db >= sc->num_data_bands);
-
-        set_bit(pos, cb->data_band_bitmap);
-
-        sc->sector_map[internal_sector] = cb->current_sector++;
-        clone->bi_sector = INT2EXT(sc->sector_map[internal_sector]);
-        clone->bi_bdev = sc->dev->bdev;
-        
-        generic_make_request(clone);
-}
-
 static void gc_cache_band(struct shingle_c *sc, struct cache_band *cb)
 {
         BUG();
@@ -388,20 +368,53 @@ static void gc_cache_band(struct shingle_c *sc, struct cache_band *cb)
         /* } */
         /* reset_cache_band(sc, cb); */
 }
-                          
+
+/*
+ * For now we only handle READ and WRITE requests that are 4KB and aligned.
+ */
 static int bad_bio(struct shingle_c *sc, struct bio *bio)
 {
+        DMERR("%lx", bio->bi_rw);
         return (bio->bi_sector & 0x7) || (bio->bi_size & 0xfff) ||
-                (EXT2INT(bio->bi_sector) >= sc->num_usable_sectors);
+                        (EXT2INT(bio->bi_sector) >= sc->num_usable_sectors);
 }
 
-static sector_t map_sector(struct shingle_c *sc, sector_t sector)
+/*
+ * Looks up |sector| in the |sector_map|.  Returns the |sector| if it does not
+ * exist in the sector map.
+ */
+static sector_t lookup_sector(struct shingle_c *sc, sector_t sector)
 {
         int32_t internal_sector = EXT2INT(sector);
-        int32_t mapped_sector = sc->sector_map[internal_sector];
-        if (!~mapped_sector)
-                mapped_sector = internal_sector;
+        int32_t xlated_sector = sc->sector_map[internal_sector];
+        
+        BUG_ON(xlated_sector >= sc->num_valid_sectors);
+        
+        if (!~xlated_sector)
+                xlated_sector = internal_sector;
+
+        return INT2EXT(xlated_sector);
+}
+
+/*
+ * Maps |sector| to a sector in the cache band.  Also sets the bit for the data
+ * band to which |sector| belongs.
+ */
+static sector_t map_sector(struct shingle_c *sc, struct cache_band *cb,
+                           sector_t sector)
+{
+        int32_t internal_sector = EXT2INT(sector);
+        int32_t data_band = internal_sector / sc->band_size_sectors;
+        int32_t pos = (data_band - cb->begin_data_band) / sc->num_cache_bands;
+        int32_t mapped_sector = cb->current_sector++;
+
         BUG_ON(mapped_sector >= sc->num_valid_sectors);
+        BUG_ON(full_cache_band(sc, cb));
+        BUG_ON(data_band >= sc->num_data_bands);
+
+        set_bit(pos, cb->data_band_bitmap);
+        sc->sector_map[internal_sector] = mapped_sector;
+
         return INT2EXT(mapped_sector);
 }
 
@@ -451,9 +464,11 @@ static void read_io(struct io *io)
                 release_io(io);
                 return;
         }
+        
         clone_init(io, clone);
-        clone->bi_sector = map_sector(sc, clone->bi_sector);
+        clone->bi_sector = lookup_sector(sc, clone->bi_sector);
         clone->bi_bdev = sc->dev->bdev;
+        
         generic_make_request(clone);
 }
 
@@ -469,15 +484,19 @@ static void write_io(struct io *io)
                 release_io(io);
                 return;
         }
-        clone_init(io, clone);
         
         if (full_cache_band(sc, cb))
                 gc_cache_band(sc, cb);
-        write_cache_band(sc, cb, clone);
+
+        clone_init(io, clone);
+        clone->bi_sector = map_sector(sc, cb, clone->bi_sector);
+        clone->bi_bdev = sc->dev->bdev;
+
+        generic_make_request(clone);
 }
 
 /*
- * This function will be executed by the worker threads.
+ * This is the entry point of the worker threads.
  */
 static void shingled(struct work_struct *work)
 {
@@ -498,21 +517,36 @@ static void queue_io(struct io *io)
         
 }
 
+static bool single_segment(struct bio *bio)
+{
+        return bio->bi_vcnt == 1 && bio->bi_size == PAGE_SIZE ;
+}
+
 static int shingle_map(struct dm_target *ti, struct bio *bio)
 {
-        unsigned long flags = bio_rw(bio);
         struct shingle_c *sc = ti->private;
-        struct io *io = alloc_io(sc, bio);
-        
+        struct cache_band *cb;
+         
         BUG_ON(bad_bio(sc, bio));
-        switch (flags) {
-        case READ:
-        case WRITE:
-                queue_io(io);
-                break;
-        default:
-                BUG();
+        
+        if (single_segment(bio)) {
+                if (bio_data_dir(bio) == READ) {
+                        bio->bi_sector = lookup_sector(sc, bio->bi_sector);
+                        bio->bi_bdev = sc->dev->bdev;
+                        DMERR("0 R %lu", bio->bi_sector);
+                        return DM_MAPIO_REMAPPED;
+                }
+                
+                cb = get_cache_band(sc, bio);
+                if (!full_cache_band(sc, cb)) {
+                        bio->bi_sector = map_sector(sc, cb, bio->bi_sector);
+                        bio->bi_bdev = sc->dev->bdev;
+                        DMERR("0 W %lu", bio->bi_sector);
+                        return DM_MAPIO_REMAPPED;
+                }
         }
+
+        queue_io(alloc_io(sc, bio));
         return DM_MAPIO_SUBMITTED;
 }
 

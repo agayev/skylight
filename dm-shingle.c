@@ -20,8 +20,6 @@
 #define LBA_TO_PBA(lba) ((int32_t) (lba / SIZE_RATIO))
 #define PBA_TO_LBA(pba) (((sector_t) pba) * SIZE_RATIO)
 
-#define NUM_LBAS_PER_PAGE (PAGE_SIZE / LBA_SIZE)
-
 struct shingle_c {
         struct dm_dev *dev;
         int64_t total_size;
@@ -400,6 +398,11 @@ static sector_t lookup_lba(struct shingle_c *sc, sector_t lba)
         return PBA_TO_LBA(mapped_pba);
 }
 
+static int32_t lookup_pba(struct shingle_c *sc, int32_t pba)
+{
+        return LBA_TO_PBA(lookup_lba(sc, PBA_TO_LBA(pba)));
+}
+
 /*
  * Maps |lba| to an lba in the cache band.  Also sets the bit for the data band
  * to which |lba| belongs.
@@ -408,10 +411,10 @@ static sector_t map_lba(struct shingle_c *sc, struct cache_band *cb,
                         sector_t lba)
 {
         int32_t data_band, pos;
-        int32_t mapped_pba = cb->current_pba++;
-        int32_t pba = LBA_TO_PBA(lba);
+        int32_t mapped_pba, pba = LBA_TO_PBA(lba);
 
         BUG_ON(full_cache_band(sc, cb));
+        mapped_pba = cb->current_pba++;
 
         /* |pba| should be in the data region. */
         BUG_ON(pba < 0 || pba >= sc->num_usable_pbas);
@@ -434,10 +437,11 @@ static void endio(struct bio *clone, int error)
         if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
                 io->error = -EIO;
 
-        DMERR("%s %c %d",
+        DMERR("%s %c %d %u",
               (io->error ? "!!" : "OK"),
               (bio_data_dir(clone) == READ ? 'R' : 'W'),
-              LBA_TO_PBA(clone->bi_sector));
+              LBA_TO_PBA(clone->bi_sector),
+              clone->bi_size);
 
         bio_put(clone);
         if (atomic_dec_and_test(&io->pending))
@@ -465,42 +469,71 @@ static struct cache_band *get_cache_band(struct shingle_c *sc, struct bio *bio)
 
 static bool single_segment(struct bio *bio)
 {
-        return bio->bi_vcnt == 1 && bio->bi_size == PAGE_SIZE ;
+        return bio->bi_vcnt == 1;
+}
+
+struct split_point {
+        int idx;
+        int vcnt;
+        sector_t sector;
+};
+
+static int find_split_points(struct shingle_c *sc, sector_t sector,
+                             unsigned short vcnt, struct split_point* sp)
+{
+        int32_t prev_pba, i, j;
+
+        sp[0].sector = sector;
+        sp[0].idx = 0;
+        prev_pba = LBA_TO_PBA(sector);
+
+        i = 0;
+        for (j = 1; j < vcnt; ++j) {
+                int32_t prev_mapped_pba = lookup_pba(sc, prev_pba);
+                int32_t curr_mapped_pba = lookup_pba(sc, prev_pba + 1);
+                if (prev_mapped_pba + 1 != curr_mapped_pba) {
+                        sp[i].vcnt = j - sp[i].idx;
+                        ++i;
+                        sp[i].idx = j;
+                        sp[i].sector = PBA_TO_LBA(curr_mapped_pba);
+                }
+                ++prev_pba;
+        }
+        sp[i].vcnt = vcnt - sp[i].idx;
+        return i + 1;
 }
 
 static void read_io(struct io *io)
 {
         struct shingle_c *sc = io->sc;
         struct bio *bio = io->bio;
-        struct bio *clone;
-        /* struct bio_vec *bv; */
-        /* sector_t last_sector, last_xlated_sector; */
-        /* int i; */
+        const int max_segments = 128;
+        struct split_point split_points[max_segments];
+        struct bio *bios[max_segments];
+        int i, j;
 
-        BUG_ON(single_segment(bio));
+        BUG_ON(single_segment(bio) || bio->bi_vcnt >= max_segments);
 
-        clone = bio_clone_bioset(bio, GFP_NOIO, sc->bs);
-        if (!clone) {
-                io->error = -ENOMEM;
-                release_io(io);
-                return;
+        j = find_split_points(sc, bio->bi_sector, bio->bi_vcnt, split_points);
+        for (i = 0; i < j; ++i) {
+                bios[i] = bio_clone_bioset(bio, GFP_NOIO, sc->bs);
+                if (!bios[i])
+                        goto bad;
+                clone_init(io, bios[i]);
+                bios[i]->bi_idx = split_points[i].idx;
+                bios[i]->bi_vcnt = split_points[i].vcnt;
+                bios[i]->bi_sector = split_points[i].sector;
         }
-        clone_init(io, clone);
 
-        /* last_sector = clone->bi_sector; */
-        /* last_xlated_sector = lookup_sector(last_sector); */
-        /* ++clone->bi_idx; */
+        for (i = 0; i < j; ++i)
+                generic_make_request(bios[i]);
+        return;
 
-        /* bio_for_each_segment(bv, clone, i) { */
-        /*         sector_t xlated_sector = lookup_sector(sc, last_sector); */
-        /*         if () { */
-        /*         } */
-        /*         last_sector +=  */
-
-        clone->bi_sector = lookup_lba(sc, clone->bi_sector);
-        clone->bi_bdev = sc->dev->bdev;
-
-        generic_make_request(clone);
+bad:
+        while (i--)
+                bio_put(bios[i]);
+        io->error = -ENOMEM;
+        release_io(io);
 }
 
 static void write_io(struct io *io)
@@ -564,7 +597,9 @@ static int shingle_map(struct dm_target *ti, struct bio *bio)
                 if (bio_data_dir(bio) == READ) {
                         bio->bi_sector = lookup_lba(sc, bio->bi_sector);
                         bio->bi_bdev = sc->dev->bdev;
-                        DMERR("0 R %d", LBA_TO_PBA(bio->bi_sector));
+                        DMERR("OK R %d %u",
+                              LBA_TO_PBA(bio->bi_sector),
+                              bio->bi_size);
                         return DM_MAPIO_REMAPPED;
                 }
 
@@ -572,7 +607,9 @@ static int shingle_map(struct dm_target *ti, struct bio *bio)
                 if (!full_cache_band(sc, cb)) {
                         bio->bi_sector = map_lba(sc, cb, bio->bi_sector);
                         bio->bi_bdev = sc->dev->bdev;
-                        DMERR("0 W %d", LBA_TO_PBA(bio->bi_sector));
+                        DMERR("OK W %d %u",
+                              LBA_TO_PBA(bio->bi_sector),
+                              bio->bi_size);
                         return DM_MAPIO_REMAPPED;
                 }
         }

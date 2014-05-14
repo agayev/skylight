@@ -7,7 +7,7 @@
 
 #define DM_MSG_PREFIX "shingle"
 
-/* 
+/*
  * Sizes of all names ending with _size or _SIZE is in bytes.
  */
 
@@ -28,14 +28,14 @@ struct shingle_c {
 
         /* Percentage of space used for cache region. */
         int32_t cache_percent;
-        
+
         /* Size of the cache region made up of multiple cache bands. */
         int64_t cache_size;
         int32_t num_cache_bands;
-        
+
         int64_t usable_size;  /* Usable size, excluding the cache region. */
         int64_t wasted_size;  /* Wasted due to alignment. */
-        
+
         int32_t track_size;
         int64_t band_size;
         int32_t band_size_tracks;
@@ -50,7 +50,7 @@ struct shingle_c {
         /* Maps a pba to its location in the cache region.  Contains -1 for
          * unmapped pbas. */
         int32_t *pba_map;
-        
+
         struct cache_band *cache_bands;
 
         int32_t num_bands;    /* Total number of available bands. */
@@ -105,10 +105,10 @@ struct cache_band {
 /*
  * This represents a single I/O operation, either read or write.  The |bio|
  * associated with it may result in multiple bios being generated, all of which
- * should completed before this one can be considered completed.  Every
- * generated bio increments |pending| and every completed bio decrements
- * pending.  When |pending| reaches zero, we deallocate |io| and signal the
- * completion of |bio| by calling |bio_endio| on it.
+ * should complete before this one can be considered completed.  Every generated
+ * bio increments |pending| and every completed bio decrements it.  When
+ * |pending| reaches zero, we deallocate |io| and signal the completion of |bio|
+ * by calling |bio_endio| on it.
  */
 struct io {
         struct shingle_c *sc;
@@ -126,7 +126,7 @@ static struct kmem_cache *_io_pool;
 static struct io *alloc_io(struct shingle_c *sc, struct bio *bio)
 {
         struct io *io = mempool_alloc(sc->io_pool, GFP_NOIO);
-        
+
         io->sc = sc;
         io->bio = bio;
         io->error = 0;
@@ -151,7 +151,7 @@ static bool get_args(struct dm_target *ti, struct shingle_c *sc,
 {
         unsigned long long tmp;
         char dummy;
-  
+
         if (argc != 4) {
                 ti->error = "dm-shingle: Invalid argument count.";
                 return false;
@@ -215,7 +215,7 @@ static void calc_params(struct shingle_c *sc)
          * cache bands are equally loaded. */
         sc->num_data_bands = (sc->num_bands / sc->num_cache_bands - 1) *
                 sc->num_cache_bands;
-  
+
         sc->cache_assoc = sc->num_data_bands / sc->num_cache_bands;
         sc->usable_size = sc->num_data_bands * sc->band_size;
         sc->wasted_size = sc->total_size - sc->cache_size - sc->usable_size;
@@ -239,7 +239,7 @@ static bool alloc_structs(struct shingle_c *sc)
         if (!sc->cache_bands)
                 return false;
 
-        /* The first pba of the cache region is |sc->num_usable_pbas|. */
+        /* The cache region starts where the data region ends. */
         pba = sc->num_usable_pbas;
         size = BITS_TO_LONGS(sc->cache_assoc) * sizeof(long);
         for (i = 0; i < sc->num_cache_bands; ++i) {
@@ -247,7 +247,7 @@ static bool alloc_structs(struct shingle_c *sc)
                 if (!bitmap)
                         return false;
                 sc->cache_bands[i].data_band_bitmap = bitmap;
-                
+
                 sc->cache_bands[i].begin_pba = pba;
                 reset_cache_band(sc, &sc->cache_bands[i]);
                 pba += sc->band_size_pbas;
@@ -263,7 +263,7 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         int32_t ret;
 
         DMERR("Constructing...");
-        
+
         sc = kmalloc(sizeof(*sc), GFP_KERNEL);
         if (!sc) {
                 ti->error = "dm-shingle: Cannot allocate shingle context.";
@@ -277,7 +277,7 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         }
 
         calc_params(sc);
-        
+
         ret = -ENOMEM;
         if (!alloc_structs(sc)) {
                 ti->error = "Cannot allocate data structures.";
@@ -289,7 +289,7 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
                 ti->error = "Cannot allocate mempool.";
                 goto bad;
         }
-        
+
         sc->bs = bioset_create(MIN_IOS, 0);
         if (!sc->bs) {
                 ti->error = "Cannot allocate bioset.";
@@ -297,8 +297,7 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         }
 
         sc->queue = alloc_workqueue("shingled",
-                                    WQ_NON_REENTRANT | WQ_MEM_RECLAIM,
-                                    1);
+                                    WQ_NON_REENTRANT | WQ_MEM_RECLAIM, 1);
         if (!sc->queue) {
                 ti->error = "Cannot allocate work queue.";
                 goto bad;
@@ -309,9 +308,10 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
                 ti->error = "dm-shingle: Device lookup failed.";
                 return -1;
         }
-        
+
         debug_print(sc);
-  
+
+        /* TODO: Reconsider proper values for these. */
         ti->num_flush_bios = 1;
         ti->num_discard_bios = 1;
         ti->num_write_same_bios = 1;
@@ -328,7 +328,7 @@ static void shingle_dtr(struct dm_target *ti)
         struct shingle_c *sc = (struct shingle_c *) ti->private;
 
         DMERR("Destructing...");
-        
+
         ti->private = NULL;
         if (!sc)
                 return;
@@ -339,7 +339,7 @@ static void shingle_dtr(struct dm_target *ti)
                 mempool_destroy(sc->io_pool);
         if (sc->dev)
                 dm_put_device(ti, sc->dev);
-        
+
         for (i = 0; i < sc->num_cache_bands; ++i)
                 if (sc->cache_bands[i].data_band_bitmap)
                         kfree(sc->cache_bands[i].data_band_bitmap);
@@ -373,22 +373,27 @@ static void gc_cache_band(struct shingle_c *sc, struct cache_band *cb)
  */
 static int bad_bio(struct shingle_c *sc, struct bio *bio)
 {
-        DMERR("%lx", bio->bi_rw);
         return (bio->bi_sector & 0x7) || (bio->bi_size & 0xfff) ||
                         (LBA_TO_PBA(bio->bi_sector) >= sc->num_usable_pbas);
 }
 
 /*
- * Translates |lba| to its physical location on disk.  Returns |lba| if it was
- * not mapped.
+ * Translates |lba| to its location in the cache region.  Returns |lba| if it
+ * was not mapped.
  */
 static sector_t lookup_lba(struct shingle_c *sc, sector_t lba)
 {
-        int32_t pba = LBA_TO_PBA(lba);
-        int32_t mapped_pba = sc->pba_map[pba];
-        
-        BUG_ON(mapped_pba >= sc->num_valid_pbas);
-        
+        int32_t mapped_pba, pba = LBA_TO_PBA(lba);
+
+        /* |pba| should be in the data region. */
+        BUG_ON(pba < 0 || pba >= sc->num_usable_pbas);
+
+        mapped_pba = sc->pba_map[pba];
+
+        /* |mapped_pba| should be in the cache region. */
+        BUG_ON(~mapped_pba && (mapped_pba < sc->num_usable_pbas ||
+                               mapped_pba >= sc->num_valid_pbas));
+
         if (!~mapped_pba)
                 mapped_pba = pba;
 
@@ -402,17 +407,22 @@ static sector_t lookup_lba(struct shingle_c *sc, sector_t lba)
 static sector_t map_lba(struct shingle_c *sc, struct cache_band *cb,
                         sector_t lba)
 {
-        int32_t pba = LBA_TO_PBA(lba);
-        int32_t data_band = pba / sc->band_size_pbas;
-        int32_t pos = (data_band - cb->begin_data_band) / sc->num_cache_bands;
+        int32_t data_band, pos;
         int32_t mapped_pba = cb->current_pba++;
+        int32_t pba = LBA_TO_PBA(lba);
 
-        BUG_ON(mapped_pba >= sc->num_valid_pbas);
         BUG_ON(full_cache_band(sc, cb));
-        BUG_ON(data_band >= sc->num_data_bands);
 
-        set_bit(pos, cb->data_band_bitmap);
+        /* |pba| should be in the data region. */
+        BUG_ON(pba < 0 || pba >= sc->num_usable_pbas);
         sc->pba_map[pba] = mapped_pba;
+
+        data_band = pba / sc->band_size_pbas;
+        BUG_ON(data_band < 0 || data_band >= sc->num_data_bands);
+
+        pos = (data_band - cb->begin_data_band) / sc->num_cache_bands;
+        BUG_ON(pos < 0 || pos >= sc->cache_assoc);
+        set_bit(pos, cb->data_band_bitmap);
 
         return PBA_TO_LBA(mapped_pba);
 }
@@ -420,14 +430,14 @@ static sector_t map_lba(struct shingle_c *sc, struct cache_band *cb,
 static void endio(struct bio *clone, int error)
 {
         struct io *io = clone->bi_private;
-        
+
         if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
                 io->error = -EIO;
 
-        DMERR("%s %c %lu",
+        DMERR("%s %c %d",
               (io->error ? "!!" : "OK"),
               (bio_data_dir(clone) == READ ? 'R' : 'W'),
-              clone->bi_sector);
+              LBA_TO_PBA(clone->bi_sector));
 
         bio_put(clone);
         if (atomic_dec_and_test(&io->pending))
@@ -446,10 +456,11 @@ static void clone_init(struct io *io, struct bio *clone)
 
 static struct cache_band *get_cache_band(struct shingle_c *sc, struct bio *bio)
 {
-        int32_t pba = LBA_TO_PBA(bio->bi_sector);
-        int32_t cbi = (pba / sc->band_size_pbas) %
-                      sc->num_cache_bands;
-        return &sc->cache_bands[cbi];
+        int32_t i, pba = LBA_TO_PBA(bio->bi_sector);
+        BUG_ON(pba < 0 || pba >= sc->num_usable_pbas);
+
+        i = (pba / sc->band_size_pbas) % sc->num_cache_bands;
+        return &sc->cache_bands[i];
 }
 
 static bool single_segment(struct bio *bio)
@@ -479,7 +490,7 @@ static void read_io(struct io *io)
         /* last_sector = clone->bi_sector; */
         /* last_xlated_sector = lookup_sector(last_sector); */
         /* ++clone->bi_idx; */
-        
+
         /* bio_for_each_segment(bv, clone, i) { */
         /*         sector_t xlated_sector = lookup_sector(sc, last_sector); */
         /*         if () { */
@@ -488,7 +499,7 @@ static void read_io(struct io *io)
 
         clone->bi_sector = lookup_lba(sc, clone->bi_sector);
         clone->bi_bdev = sc->dev->bdev;
-        
+
         generic_make_request(clone);
 }
 
@@ -504,7 +515,7 @@ static void write_io(struct io *io)
                 release_io(io);
                 return;
         }
-        
+
         if (full_cache_band(sc, cb))
                 gc_cache_band(sc, cb);
 
@@ -531,17 +542,17 @@ static void shingled(struct work_struct *work)
 static void queue_io(struct io *io)
 {
         struct shingle_c *sc = io->sc;
-        
+
         INIT_WORK(&io->work, shingled);
         queue_work(sc->queue, &io->work);
-        
+
 }
 
 static int shingle_map(struct dm_target *ti, struct bio *bio)
 {
         struct shingle_c *sc = ti->private;
         struct cache_band *cb;
-         
+
         BUG_ON(bad_bio(sc, bio));
 
         /*
@@ -553,15 +564,15 @@ static int shingle_map(struct dm_target *ti, struct bio *bio)
                 if (bio_data_dir(bio) == READ) {
                         bio->bi_sector = lookup_lba(sc, bio->bi_sector);
                         bio->bi_bdev = sc->dev->bdev;
-                        DMERR("0 R %lu", bio->bi_sector);
+                        DMERR("0 R %d", LBA_TO_PBA(bio->bi_sector));
                         return DM_MAPIO_REMAPPED;
                 }
-                
+
                 cb = get_cache_band(sc, bio);
                 if (!full_cache_band(sc, cb)) {
                         bio->bi_sector = map_lba(sc, cb, bio->bi_sector);
                         bio->bi_bdev = sc->dev->bdev;
-                        DMERR("0 W %lu", bio->bi_sector);
+                        DMERR("0 W %d", LBA_TO_PBA(bio->bi_sector));
                         return DM_MAPIO_REMAPPED;
                 }
         }
@@ -607,8 +618,8 @@ static int __init dm_shingle_init(void)
         _io_pool = KMEM_CACHE(io, 0);
         if (!_io_pool)
                 return -ENOMEM;
-        
-        r = dm_register_target(&shingle_target);        
+
+        r = dm_register_target(&shingle_target);
         if (r < 0) {
                 DMERR("register failed %d", r);
                 kmem_cache_destroy(_io_pool);

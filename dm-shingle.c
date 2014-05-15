@@ -479,18 +479,19 @@ static void endio(struct bio *clone, int error)
                 release_io(io);
 }
 
-static void clone_init(struct io *io, struct bio *clone, struct chunk *sp)
+static void clone_init(struct io *io, struct bio *clone, int i)
 {
         struct shingle_c *sc = io->sc;
+        struct chunk *cp = &io->chunks[i];
 
         atomic_inc(&io->pending);
         clone->bi_private = io;
         clone->bi_end_io = endio;
         clone->bi_bdev = sc->dev->bdev;
 
-        clone->bi_idx = sp->idx;
-        clone->bi_vcnt = sp->vcnt;
-        clone->bi_sector = sp->sector;
+        clone->bi_idx = cp->idx;
+        clone->bi_vcnt = cp->vcnt;
+        clone->bi_sector = cp->sector;
 }
 
 static struct cache_band *get_cache_band(struct shingle_c *sc, int data_band)
@@ -505,25 +506,25 @@ static struct cache_band *get_cache_band(struct shingle_c *sc, int data_band)
 /*
  * Helper function for |find_write_chunks|.
  */
-static void fill_chunk(struct shingle_c *sc, struct io *io, int si,
-                       int data_band, int vcnt)
+static void fill_chunk(struct io *io, int i, int data_band, int vcnt)
 {
+        struct shingle_c *sc = io->sc;
         struct bio *bio = io->bio;
-        struct chunk *sp = &io->chunks[si];
+        struct chunk *cp = &io->chunks[i];
         struct cache_band *cb = get_cache_band(sc, data_band);
         int32_t pbas_left = sc->band_size_pbas -
                             (cb->current_pba - cb->begin_pba);
 
-        BUG_ON(si < 0);
-        sp->idx = si ? io->chunks[si-1].vcnt : 0;
-        sp->vcnt = vcnt;
-        sp->requires_gc = vcnt > pbas_left;
+        BUG_ON(i < 0);
+        cp->idx = i ? io->chunks[i-1].vcnt : 0;
+        cp->vcnt = vcnt;
+        cp->requires_gc = vcnt > pbas_left;
 
-        if (sp->requires_gc)
-                sp->sector = PBA_TO_LBA(cb->begin_pba);
+        if (cp->requires_gc)
+                cp->sector = PBA_TO_LBA(cb->begin_pba);
         else
-                sp->sector = map_lba(sc, cb,
-                                     bio->bi_sector + sp->idx * LBAS_IN_PAGE);
+                cp->sector = map_lba(sc, cb,
+                                     bio->bi_sector + cp->idx * LBAS_IN_PAGE);
 }
 
 /*
@@ -539,8 +540,9 @@ static void fill_chunk(struct shingle_c *sc, struct io *io, int si,
  * |io->chunks[0]| and return 1.  Otherwise, we also set |io->chunks[1]| and
  * return 2.
  */
-static int find_write_chunks(struct shingle_c *sc, struct io *io)
+static int find_write_chunks(struct io *io)
 {
+        struct shingle_c *sc = io->sc;
         struct bio *bio = io->bio;
         int32_t pba, data_band, size_pbas = bio->bi_size / PBA_SIZE;
         int32_t pbas_left_in_band, chunk_size_pbas;
@@ -555,13 +557,13 @@ static int find_write_chunks(struct shingle_c *sc, struct io *io)
         pbas_left_in_band = sc->band_size_pbas - (pba % sc->band_size_pbas);
         chunk_size_pbas = min(pbas_left_in_band, size_pbas);
 
-        fill_chunk(sc, io, 0, data_band, chunk_size_pbas);
+        fill_chunk(io, 0, data_band, chunk_size_pbas);
 
         chunk_size_pbas = size_pbas - chunk_size_pbas;
         if (!chunk_size_pbas)
                 return io->num_chunks = 1;
 
-        fill_chunk(sc, io, 1, ++data_band, chunk_size_pbas);
+        fill_chunk(io, 1, ++data_band, chunk_size_pbas);
         return io->num_chunks = 2;
 }
 
@@ -576,8 +578,9 @@ static int find_write_chunks(struct shingle_c *sc, struct io *io)
  * split points are those where contiguity is broken due to sectors mapped to
  * cache band.  See |find_write_chunks| for the write splitting logic.
  */
-static int find_read_chunks(struct shingle_c *sc, struct io *io)
+static int find_read_chunks(struct io *io)
 {
+        struct shingle_c *sc = io->sc;
         struct bio *bio = io->bio;
         struct chunk *chunks = io->chunks;
         sector_t prev_lba;
@@ -624,7 +627,7 @@ static void do_non_contig_io(struct io *io)
                         goto bad;
         }
         for (i = 0; i < io->num_chunks; ++i) {
-                clone_init(io, bios[i], &io->chunks[i]);
+                clone_init(io, bios[i], i);
                 generic_make_request(bios[i]);
         }
         return;
@@ -675,18 +678,19 @@ static bool requires_gc(struct io *io)
  * I/O is contiguous, if for reads it does not need to be split, and for writes,
  * it does not need to be split as well as no gc required.
  */
-static bool contig_io(struct shingle_c *sc, struct io *io)
+static bool contig_io(struct io *io)
 {
         struct bio *bio = io->bio;
 
         if (bio_data_dir(bio) == READ)
-                return find_read_chunks(sc, io) == 1;
+                return find_read_chunks(io) == 1;
 
-        return find_write_chunks(sc, io) == 1 && !requires_gc(io);
+        return find_write_chunks(io) == 1 && !requires_gc(io);
 }
 
-static void remap_io(struct shingle_c *sc, struct io *io)
+static void remap_io(struct io *io)
 {
+        struct shingle_c *sc = io->sc;
         struct bio *bio = io->bio;
 
         bio->bi_sector = io->chunks[0].sector;
@@ -708,8 +712,8 @@ static int shingle_map(struct dm_target *ti, struct bio *bio)
         if (!io)
                 return -EIO;
 
-        if (contig_io(sc, io)) {
-                remap_io(sc, io);
+        if (contig_io(io)) {
+                remap_io(io);
                 mempool_free(io, sc->io_pool);
                 return DM_MAPIO_REMAPPED;
         }

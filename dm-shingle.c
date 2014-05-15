@@ -9,6 +9,15 @@
 
 /*
  * Sizes of all names ending with _size or _SIZE is in bytes.
+ *
+ * From Seagate:
+ *
+ * Consider the following scale of sizes:
+ *  - tracks in the range of 0.5 to 2 MiB
+ *  - bands in the range of 20 to 200 tracks
+ *  - drives in the range of 1 to 10 TB
+ *  - a 1% cache space could be a single, very large band or many smaller bands
+ *  - the 99% data space as tens of thousands of bands
  */
 
 #define TOTAL_SIZE (76LL << 10)
@@ -19,6 +28,8 @@
 
 #define LBA_TO_PBA(lba) ((int32_t) (lba / SIZE_RATIO))
 #define PBA_TO_LBA(pba) (((sector_t) pba) * SIZE_RATIO)
+
+#define LBAS_IN_PAGE (PAGE_SIZE / LBA_SIZE)
 
 struct shingle_c {
         struct dm_dev *dev;
@@ -101,18 +112,38 @@ struct cache_band {
 };
 
 /*
+ * TODO: We can reduce memory usage by reducing this number, explore how
+ * realistic 32 is, since in practice the number seems to be much smaller.
+ */
+#define MAX_SEGMENTS_IN_BIO 32
+
+/*
+ * A bio may be split into chunks if the underlying sectors are scattered
+ * between data band and cache bands.  This struct represents a chunk resulting
+ * from splitting a bio.
+ */
+struct chunk {
+        int idx;
+        int vcnt;
+        sector_t sector;
+        bool requires_gc;
+};
+
+/*
  * This represents a single I/O operation, either read or write.  The |bio|
- * associated with it may result in multiple bios being generated, all of which
- * should complete before this one can be considered completed.  Every generated
- * bio increments |pending| and every completed bio decrements it.  When
- * |pending| reaches zero, we deallocate |io| and signal the completion of |bio|
- * by calling |bio_endio| on it.
+ * associated with it may result in multiple bios being generated (see |chunk|
+ * above), all of which should complete before this one can be considered
+ * complete.  Every generated bio increments |pending| and every completed bio
+ * decrements it.  When |pending| reaches zero, we deallocate |io| and signal
+ * the completion of |bio| by calling |bio_endio| on it.
  */
 struct io {
         struct shingle_c *sc;
         struct bio *bio;
         struct work_struct work;
         int error;
+        struct chunk chunks[MAX_SEGMENTS_IN_BIO];
+        int num_chunks;
         atomic_t pending;
 };
 
@@ -125,6 +156,12 @@ static struct io *alloc_io(struct shingle_c *sc, struct bio *bio)
 {
         struct io *io = mempool_alloc(sc->io_pool, GFP_NOIO);
 
+        if (unlikely(!io)) {
+                DMERR("Cannot allocate io from mempool.");
+                return NULL;
+        }
+
+        memset(io, 0, sizeof(*io));
         io->sc = sc;
         io->bio = bio;
         io->error = 0;
@@ -155,7 +192,7 @@ static bool get_args(struct dm_target *ti, struct shingle_c *sc,
                 return false;
         }
 
-        /* TODO: FIX THOSE BOUNDS */
+        /* TODO: Change bounds back after testing. */
         if (sscanf(argv[1], "%llu%c", &tmp, &dummy) != 1 || tmp & 0xfff ||
             (tmp < /* 512 */ 4 * 1024 || tmp > 2 * 1024 * 1024)) {
                 ti->error = "dm-shingle: Invalid track size.";
@@ -349,30 +386,32 @@ static void shingle_dtr(struct dm_target *ti)
         kfree(sc);
 }
 
-static int full_cache_band(struct shingle_c *sc, struct cache_band *cb)
-{
-        return cb->current_pba == cb->begin_pba + sc->band_size_pbas;
-}
+/* static int full_cache_band(struct shingle_c *sc, struct cache_band *cb) */
+/* { */
+/*         return cb->current_pba == cb->begin_pba + sc->band_size_pbas; */
+/* } */
 
-static void gc_cache_band(struct shingle_c *sc, struct cache_band *cb)
-{
-        BUG();
-        /* int i; */
-        /* for_each_set_bit(i, cb->data_band_bitmap, sc->cache_assoc) { */
-        /*         int32_t db = i * sc->num_cache_bands + cb->begin_data_band; */
-        /*         DMERR("GC: data band %d has data in the cache buffer.", db); */
-        /*         read_modify_write_data_band(sc, db); */
-        /* } */
-        /* reset_cache_band(sc, cb); */
-}
+/* static void gc_cache_band(struct shingle_c *sc, struct cache_band *cb) */
+/* { */
+/*         BUG(); */
+/*         /\* int i; *\/ */
+/*         /\* for_each_set_bit(i, cb->data_band_bitmap, sc->cache_assoc) { *\/ */
+/*         /\*         int32_t db = i * sc->num_cache_bands + cb->begin_data_band; *\/ */
+/*         /\*         DMERR("GC: data band %d has data in the cache buffer.", db); *\/ */
+/*         /\*         read_modify_write_data_band(sc, db); *\/ */
+/*         /\* } *\/ */
+/*         /\* reset_cache_band(sc, cb); *\/ */
+/* } */
 
 /*
- * For now we only handle READ and WRITE requests that are 4KB and aligned.
+ * For now we only handle READ and WRITE requests that are 4KB and aligned and
+ * we assume there are no more than MAX_SEGMENTS_IN_BIO segments in a bio.
  */
 static int bad_bio(struct shingle_c *sc, struct bio *bio)
 {
         return (bio->bi_sector & 0x7) || (bio->bi_size & 0xfff) ||
-                        (LBA_TO_PBA(bio->bi_sector) >= sc->num_usable_pbas);
+                        (LBA_TO_PBA(bio->bi_sector) >= sc->num_usable_pbas) ||
+                        (bio->bi_vcnt > MAX_SEGMENTS_IN_BIO);
 }
 
 /*
@@ -398,11 +437,6 @@ static sector_t lookup_lba(struct shingle_c *sc, sector_t lba)
         return PBA_TO_LBA(mapped_pba);
 }
 
-static int32_t lookup_pba(struct shingle_c *sc, int32_t pba)
-{
-        return LBA_TO_PBA(lookup_lba(sc, PBA_TO_LBA(pba)));
-}
-
 /*
  * Maps |lba| to an lba in the cache band.  Also sets the bit for the data band
  * to which |lba| belongs.
@@ -413,7 +447,7 @@ static sector_t map_lba(struct shingle_c *sc, struct cache_band *cb,
         int32_t data_band, pos;
         int32_t mapped_pba, pba = LBA_TO_PBA(lba);
 
-        BUG_ON(full_cache_band(sc, cb));
+        BUG_ON(cb->current_pba == cb->begin_pba + sc->band_size_pbas);
         mapped_pba = cb->current_pba++;
 
         /* |pba| should be in the data region. */
@@ -437,18 +471,19 @@ static void endio(struct bio *clone, int error)
         if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
                 io->error = -EIO;
 
+        /* TODO: Remove once everything works. */
         DMERR("%s %c %d %u",
               (io->error ? "!!" : "OK"),
               (bio_data_dir(clone) == READ ? 'R' : 'W'),
               LBA_TO_PBA(clone->bi_sector),
-              clone->bi_size);
+              clone->bi_vcnt);
 
         bio_put(clone);
         if (atomic_dec_and_test(&io->pending))
                 release_io(io);
 }
 
-static void clone_init(struct io *io, struct bio *clone)
+static void clone_init(struct io *io, struct bio *clone, struct chunk *sp)
 {
         struct shingle_c *sc = io->sc;
 
@@ -456,77 +491,146 @@ static void clone_init(struct io *io, struct bio *clone)
         clone->bi_private = io;
         clone->bi_end_io = endio;
         clone->bi_bdev = sc->dev->bdev;
+
+        clone->bi_idx = sp->idx;
+        clone->bi_vcnt = sp->vcnt;
+        clone->bi_sector = sp->sector;
 }
 
-static struct cache_band *get_cache_band(struct shingle_c *sc, struct bio *bio)
+static struct cache_band *get_cache_band(struct shingle_c *sc, int data_band)
 {
-        int32_t i, pba = LBA_TO_PBA(bio->bi_sector);
-        BUG_ON(pba < 0 || pba >= sc->num_usable_pbas);
+        int i = data_band % sc->num_cache_bands;
 
-        i = (pba / sc->band_size_pbas) % sc->num_cache_bands;
+        BUG_ON(data_band >= sc->num_data_bands);
+
         return &sc->cache_bands[i];
 }
 
-static bool single_segment(struct bio *bio)
+/*
+ * Helper function for |find_write_chunks|.
+ */
+static void fill_chunk(struct shingle_c *sc, struct io *io, int si,
+                       int data_band, int vcnt)
 {
-        return bio->bi_vcnt == 1;
+        struct bio *bio = io->bio;
+        struct chunk *sp = &io->chunks[si];
+        struct cache_band *cb = get_cache_band(sc, data_band);
+        int32_t pbas_left = sc->band_size_pbas -
+                            (cb->current_pba - cb->begin_pba);
+
+        BUG_ON(si < 0);
+        sp->idx = si ? io->chunks[si-1].vcnt : 0;
+        sp->vcnt = vcnt;
+        sp->requires_gc = vcnt > pbas_left;
+
+        if (sp->requires_gc)
+                sp->sector = PBA_TO_LBA(cb->begin_pba);
+        else
+                sp->sector = map_lba(sc, cb,
+                                     bio->bi_sector + sp->idx * LBAS_IN_PAGE);
 }
 
-struct split_point {
-        int idx;
-        int vcnt;
-        sector_t sector;
-};
-
-static int find_split_points(struct shingle_c *sc, sector_t sector,
-                             unsigned short vcnt, struct split_point* sp)
+/*
+ * When we receive a write at this layer, no matter how large the original write
+ * size was, the kernel splits it into bios of at most 512 KB.  I haven't
+ * verified it yet, but I remember reading it in a book.
+ *
+ * The point is, given the numbers at the top of this file regarding band and
+ * track sizes, minimum size for a band is 10 MB, which means a write can cross
+ * at most two bands, therefore a write bio may be split in at most one point.
+ *
+ * If |io->bio| does not cross bands, then we set the required mapping for it in
+ * |io->chunks[0]| and return 1.  Otherwise, we also set |io->chunks[1]| and
+ * return 2.
+ */
+static int find_write_chunks(struct shingle_c *sc, struct io *io)
 {
-        int32_t prev_pba, i, j;
+        struct bio *bio = io->bio;
+        int32_t pba, data_band, size_pbas = bio->bi_size / PBA_SIZE;
+        int32_t pbas_left_in_band, chunk_size_pbas;
 
-        sp[0].sector = sector;
-        sp[0].idx = 0;
-        prev_pba = LBA_TO_PBA(sector);
+        pba = LBA_TO_PBA(bio->bi_sector);
+        BUG_ON(pba < 0 || pba >= sc->num_usable_pbas);
+
+        /* The band where staring pba is located. */
+        data_band = pba / sc->band_size_pbas;
+        BUG_ON(data_band >= sc->num_data_bands);
+
+        pbas_left_in_band = sc->band_size_pbas - (pba % sc->band_size_pbas);
+        chunk_size_pbas = min(pbas_left_in_band, size_pbas);
+
+        fill_chunk(sc, io, 0, data_band, chunk_size_pbas);
+
+        chunk_size_pbas = size_pbas - chunk_size_pbas;
+        if (!chunk_size_pbas)
+                return io->num_chunks = 1;
+
+        fill_chunk(sc, io, 1, ++data_band, chunk_size_pbas);
+        return io->num_chunks = 2;
+}
+
+/*
+ * Although a bio may be contiguous in LBA-space, it may not be so in PBA-space
+ * since some of the LBAs may be located in the cache band.  This function
+ * splits a bio into contiguous chunks fills up |io->chunks| array and returns
+ * the number of chunks.  It returns 1 for a bio that is contiguous in
+ * PBA-space.
+ *
+ * The splitting logic differs for a read bio and a write bio.   For a read, the
+ * split points are those where contiguity is broken due to sectors mapped to
+ * cache band.  See |find_write_chunks| for the write splitting logic.
+ */
+static int find_read_chunks(struct shingle_c *sc, struct io *io)
+{
+        struct bio *bio = io->bio;
+        struct chunk *chunks = io->chunks;
+        sector_t prev_lba;
+        int i, j;
+
+        BUG_ON(bio_data_dir(bio) != READ);
+
+        chunks[0].idx = 0;
+        chunks[0].sector = lookup_lba(sc, bio->bi_sector);
+        prev_lba = bio->bi_sector;
 
         i = 0;
-        for (j = 1; j < vcnt; ++j) {
-                int32_t prev_mapped_pba = lookup_pba(sc, prev_pba);
-                int32_t curr_mapped_pba = lookup_pba(sc, prev_pba + 1);
-                if (prev_mapped_pba + 1 != curr_mapped_pba) {
-                        sp[i].vcnt = j - sp[i].idx;
+        for (j = 1; j < bio->bi_vcnt; ++j) {
+                int32_t curr_lba = prev_lba + LBAS_IN_PAGE;
+                int32_t curr_mapped_lba = lookup_lba(sc, curr_lba);
+                int32_t prev_mapped_lba = lookup_lba(sc, prev_lba);
+
+                if (prev_mapped_lba + LBAS_IN_PAGE != curr_mapped_lba) {
+                        chunks[i].vcnt = j - chunks[i].idx;
                         ++i;
-                        sp[i].idx = j;
-                        sp[i].sector = PBA_TO_LBA(curr_mapped_pba);
+                        chunks[i].idx = j;
+                        chunks[i].sector = curr_mapped_lba;
                 }
-                ++prev_pba;
+                prev_lba += LBAS_IN_PAGE;
         }
-        sp[i].vcnt = vcnt - sp[i].idx;
-        return i + 1;
+        chunks[i].vcnt = bio->bi_vcnt - chunks[i].idx;
+        return io->num_chunks = i + 1;
 }
 
-static void read_io(struct io *io)
+static bool requires_gc(struct io *io);
+
+static void do_non_contig_io(struct io *io)
 {
         struct shingle_c *sc = io->sc;
         struct bio *bio = io->bio;
-        const int max_segments = 128;
-        struct split_point split_points[max_segments];
-        struct bio *bios[max_segments];
-        int i, j;
+        struct bio *bios[MAX_SEGMENTS_IN_BIO];
+        int i;
 
-        BUG_ON(single_segment(bio) || bio->bi_vcnt >= max_segments);
+        BUG_ON(io->num_chunks <= 1 || requires_gc(io));
 
-        j = find_split_points(sc, bio->bi_sector, bio->bi_vcnt, split_points);
-        for (i = 0; i < j; ++i) {
+        for (i = 0; i < io->num_chunks; ++i) {
                 bios[i] = bio_clone_bioset(bio, GFP_NOIO, sc->bs);
                 if (!bios[i])
                         goto bad;
-                clone_init(io, bios[i]);
-                bios[i]->bi_idx = split_points[i].idx;
-                bios[i]->bi_vcnt = split_points[i].vcnt;
-                bios[i]->bi_sector = split_points[i].sector;
         }
-
-        for (i = 0; i < j; ++i)
+        for (i = 0; i < io->num_chunks; ++i) {
+                clone_init(io, bios[i], &io->chunks[i]);
                 generic_make_request(bios[i]);
+        }
         return;
 
 bad:
@@ -536,27 +640,9 @@ bad:
         release_io(io);
 }
 
-static void write_io(struct io *io)
+static void start_gc(struct io *io)
 {
-        struct shingle_c *sc = io->sc;
-        struct bio *bio = io->bio;
-        struct bio *clone = bio_clone_bioset(bio, GFP_NOIO, sc->bs);
-        struct cache_band *cb = get_cache_band(sc, bio);
-
-        if (!clone) {
-                io->error = -ENOMEM;
-                release_io(io);
-                return;
-        }
-
-        if (full_cache_band(sc, cb))
-                gc_cache_band(sc, cb);
-
-        clone_init(io, clone);
-        clone->bi_sector = map_lba(sc, cb, clone->bi_sector);
-        clone->bi_bdev = sc->dev->bdev;
-
-        generic_make_request(clone);
+        BUG();
 }
 
 /*
@@ -566,10 +652,10 @@ static void shingled(struct work_struct *work)
 {
         struct io *io = container_of(work, struct io, work);
 
-        if (bio_data_dir(io->bio) == READ)
-                read_io(io);
+        if (requires_gc(io))
+                start_gc(io);
         else
-                write_io(io);
+                do_non_contig_io(io);
 }
 
 static void queue_io(struct io *io)
@@ -578,43 +664,60 @@ static void queue_io(struct io *io)
 
         INIT_WORK(&io->work, shingled);
         queue_work(sc->queue, &io->work);
+}
 
+static bool requires_gc(struct io *io)
+{
+        if (bio_data_dir(io->bio) == READ)
+                return false;
+
+        BUG_ON(io->num_chunks > 2);
+        return io->chunks[0].requires_gc || io->chunks[1].requires_gc;
+}
+
+/*
+ * I/O is contiguous, if for reads it does not need to be split, and for writes,
+ * it does not need to be split as well as no gc required.
+ */
+static bool contig_io(struct shingle_c *sc, struct io *io)
+{
+        struct bio *bio = io->bio;
+
+        if (bio_data_dir(bio) == READ)
+                return find_read_chunks(sc, io) == 1;
+
+        return find_write_chunks(sc, io) == 1 && !requires_gc(io);
+}
+
+static void remap_io(struct shingle_c *sc, struct io *io)
+{
+        struct bio *bio = io->bio;
+
+        bio->bi_sector = io->chunks[0].sector;
+        bio->bi_bdev = sc->dev->bdev;
+
+        /* TODO: Remove once everything works. */
+        DMERR("OK %c %d %u", (bio_data_dir(bio) == READ ? 'R' : 'W'),
+              LBA_TO_PBA(bio->bi_sector), bio->bi_vcnt);
 }
 
 static int shingle_map(struct dm_target *ti, struct bio *bio)
 {
         struct shingle_c *sc = ti->private;
-        struct cache_band *cb;
+        struct io *io;
 
         BUG_ON(bad_bio(sc, bio));
 
-        /*
-         * TODO: It is possible that even a multi-segment bio can proceed just
-         * after a simple remap.  Handle that as well, in which case
-         * single-segment I/O will become a special case of that.
-         */
-        if (single_segment(bio)) {
-                if (bio_data_dir(bio) == READ) {
-                        bio->bi_sector = lookup_lba(sc, bio->bi_sector);
-                        bio->bi_bdev = sc->dev->bdev;
-                        DMERR("OK R %d %u",
-                              LBA_TO_PBA(bio->bi_sector),
-                              bio->bi_size);
-                        return DM_MAPIO_REMAPPED;
-                }
+        io = alloc_io(sc, bio);
+        if (!io)
+                return -EIO;
 
-                cb = get_cache_band(sc, bio);
-                if (!full_cache_band(sc, cb)) {
-                        bio->bi_sector = map_lba(sc, cb, bio->bi_sector);
-                        bio->bi_bdev = sc->dev->bdev;
-                        DMERR("OK W %d %u",
-                              LBA_TO_PBA(bio->bi_sector),
-                              bio->bi_size);
-                        return DM_MAPIO_REMAPPED;
-                }
+        if (contig_io(sc, io)) {
+                remap_io(sc, io);
+                mempool_free(io, sc->io_pool);
+                return DM_MAPIO_REMAPPED;
         }
-
-        queue_io(alloc_io(sc, bio));
+        queue_io(io);
         return DM_MAPIO_SUBMITTED;
 }
 

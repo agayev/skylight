@@ -386,11 +386,6 @@ static void shingle_dtr(struct dm_target *ti)
         kfree(sc);
 }
 
-/* static int full_cache_band(struct shingle_c *sc, struct cache_band *cb) */
-/* { */
-/*         return cb->current_pba == cb->begin_pba + sc->band_size_pbas; */
-/* } */
-
 /* static void gc_cache_band(struct shingle_c *sc, struct cache_band *cb) */
 /* { */
 /*         BUG(); */
@@ -447,6 +442,7 @@ static sector_t map_lba(struct shingle_c *sc, struct cache_band *cb,
         int32_t data_band, pos;
         int32_t mapped_pba, pba = LBA_TO_PBA(lba);
 
+        /* Cache band should not be full if we are mapping |lba| to it. */
         BUG_ON(cb->current_pba == cb->begin_pba + sc->band_size_pbas);
         mapped_pba = cb->current_pba++;
 

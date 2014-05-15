@@ -299,7 +299,7 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
         DMERR("Constructing...");
 
-        sc = kmalloc(sizeof(*sc), GFP_KERNEL);
+        sc = kzalloc(sizeof(*sc), GFP_KERNEL);
         if (!sc) {
                 ti->error = "dm-shingle: Cannot allocate shingle context.";
                 return -ENOMEM;
@@ -307,7 +307,7 @@ static int shingle_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         ti->private = sc;
 
         if (!get_args(ti, sc, argc, argv)) {
-                kfree(sc);
+                kzfree(sc);
                 return -EINVAL;
         }
 
@@ -383,7 +383,7 @@ static void shingle_dtr(struct dm_target *ti)
                 vfree(sc->pba_map);
         if (sc->cache_bands)
                 vfree(sc->cache_bands);
-        kfree(sc);
+        kzfree(sc);
 }
 
 /* static void gc_cache_band(struct shingle_c *sc, struct cache_band *cb) */

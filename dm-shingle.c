@@ -8,8 +8,6 @@
 #define DM_MSG_PREFIX "shingle"
 
 /*
- * Sizes of all names ending with _size or _SIZE is in bytes.
- *
  * From Seagate:
  *
  * Consider the following scale of sizes:
@@ -18,6 +16,10 @@
  *  - drives in the range of 1 to 10 TB
  *  - a 1% cache space could be a single, very large band or many smaller bands
  *  - the 99% data space as tens of thousands of bands
+ */
+
+/*
+ * Sizes of all names ending with _size or _SIZE is in bytes.
  */
 
 #define TOTAL_SIZE (76LL << 10)
@@ -30,6 +32,13 @@
 #define PBA_TO_LBA(pba) (((sector_t) pba) * SIZE_RATIO)
 
 #define LBAS_IN_PAGE (PAGE_SIZE / LBA_SIZE)
+
+#define DBG(bio, error)                                  \
+        DMERR("%s %c %d %u",                             \
+              (error ? "!!" : "OK"),                     \
+              (bio_data_dir(bio) == READ ? 'R' : 'W'),   \
+              LBA_TO_PBA(bio->bi_sector),                \
+              bio->bi_vcnt)
 
 struct shingle_c {
         struct dm_dev *dev;
@@ -467,12 +476,7 @@ static void endio(struct bio *clone, int error)
         if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
                 io->error = -EIO;
 
-        /* TODO: Remove once everything works. */
-        DMERR("%s %c %d %u",
-              (io->error ? "!!" : "OK"),
-              (bio_data_dir(clone) == READ ? 'R' : 'W'),
-              LBA_TO_PBA(clone->bi_sector),
-              clone->bi_vcnt);
+        DBG(clone, error);    /* TODO: Remove. */
 
         bio_put(clone);
         if (atomic_dec_and_test(&io->pending))
@@ -696,9 +700,7 @@ static void remap_io(struct io *io)
         bio->bi_sector = io->chunks[0].sector;
         bio->bi_bdev = sc->dev->bdev;
 
-        /* TODO: Remove once everything works. */
-        DMERR("OK %c %d %u", (bio_data_dir(bio) == READ ? 'R' : 'W'),
-              LBA_TO_PBA(bio->bi_sector), bio->bi_vcnt);
+        DBG(bio, 0);          /* TODO: Remove. */
 }
 
 static int shingle_map(struct dm_target *ti, struct bio *bio)

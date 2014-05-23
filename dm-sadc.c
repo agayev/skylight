@@ -56,14 +56,12 @@
 #define pba_to_lba(pba) (((sector_t) pba) * LBAS_IN_PBA)
 
 #define DBG(bio, error)                                  \
-        DMERR("%s %c %d [%lu] %u %p",                    \
+        DMERR("%s %c %d [%lu] %u",                       \
               (error ? "!!" : "OK"),                     \
               (bio_data_dir(bio) == READ ? 'R' : 'W'),   \
               lba_to_pba(bio->bi_sector),                \
               bio->bi_sector,                            \
-              bio->bi_size / LBA_SIZE,                   \
-              bio->bi_next)
-
+              bio->bi_size / LBA_SIZE)
 
 enum state {
         STATE_START_GC,
@@ -321,7 +319,6 @@ static void calc_params(struct sadc_c *sc)
         WARN_ON(sc->usable_size % PBA_SIZE);
 }
 
-
 static void reset_cache_band(struct sadc_c *sc, struct cache_band *cb)
 {
         cb->current_pba = cb->begin_pba;
@@ -354,6 +351,7 @@ static bool alloc_structs(struct sadc_c *sc)
                 sc->cache_bands[i].map = bitmap;
 
                 sc->cache_bands[i].begin_pba = pba;
+                sc->cache_bands[i].begin_data_band = i;
                 reset_cache_band(sc, &sc->cache_bands[i]);
                 pba += sc->band_size_pbas;
         }
@@ -473,7 +471,11 @@ static int32_t band(struct sadc_c *sc, sector_t lba)
 /* Returns the cache band for the |band|. */
 static struct cache_band *cache_band(struct sadc_c *sc, int32_t band)
 {
-        return &sc->cache_bands[band % sc->num_cache_bands];
+        int i = band % sc->num_cache_bands;
+
+        WARN_ON(!(0 <= i && i < sc->num_cache_bands));
+
+        return &sc->cache_bands[i];
 }
 
 /* Returns available space in pbas in cache band |cb|.  */
@@ -508,10 +510,11 @@ static sector_t map_lba(struct sadc_c *sc, sector_t lba)
         struct cache_band *cb = cache_band(sc, b);
         int i = (b - cb->begin_data_band) / sc->num_cache_bands;
 
-        WARN_ON(!space_in_cache_band(sc, cb) ||
-               !(0 <= pba && pba < sc->num_usable_pbas) ||
-               !(0 <= b && b < sc->num_data_bands) ||
-               !(0 <= i && i < sc->cache_assoc));
+
+        WARN_ON(!space_in_cache_band(sc, cb));
+        WARN_ON(!(0 <= pba && pba < sc->num_usable_pbas));
+        WARN_ON(!(0 <= b && b < sc->num_data_bands));
+        WARN_ON(!(0 <= i && i < sc->cache_assoc));
 
         sc->pba_map[pba] = cb->current_pba++;
         i = (b - cb->begin_data_band) / sc->num_cache_bands;
@@ -887,6 +890,13 @@ static int do_modify_data_band(struct sadc_c *sc, int error)
                         goto bad;
                 ++j;
         }
+
+        /*
+         * There should definitely be something to modify, or we should not be
+         * doing RMW on this band.  Otherwise, we will return -EINPROGRESS, but
+         * no request will be launched and |gc| will not be called.
+         */
+        WARN_ON(!j);
 
         for (i = 0; i < j; ++i)
                 generic_make_request(nbios[i]);

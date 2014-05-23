@@ -510,7 +510,6 @@ static sector_t map_lba(struct sadc_c *sc, sector_t lba)
         struct cache_band *cb = cache_band(sc, b);
         int i = (b - cb->begin_data_band) / sc->num_cache_bands;
 
-
         WARN_ON(!space_in_cache_band(sc, cb));
         WARN_ON(!(0 <= pba && pba < sc->num_usable_pbas));
         WARN_ON(!(0 <= b && b < sc->num_data_bands));

@@ -40,7 +40,8 @@
  * This code assumes that maximum segment size in a bio is equal to PAGE_SIZE,
  * which is equal to 4096 bytes.  Things may break if this is not the case.
  */
-#define TOTAL_SIZE (76LL << 10)
+#define MIN_DISK_SIZE (76LL << 10)
+#define MAX_DISK_SIZE (10LL << 40)
 
 #define LBA_SIZE 512
 #define PBA_SIZE 4096
@@ -76,7 +77,7 @@ enum state {
 
 struct sadc_c {
         struct dm_dev *dev;
-        int64_t total_size;
+        int64_t disk_size;
 
         /* Percentage of space used for cache region. */
         int32_t cache_percent;
@@ -253,7 +254,7 @@ static bool get_args(struct dm_target *ti, struct sadc_c *sc,
         unsigned long long tmp;
         char dummy;
 
-        if (argc != 4) {
+        if (argc != 5) {
                 ti->error = "dm-sadc: Invalid argument count.";
                 return false;
         }
@@ -277,6 +278,14 @@ static bool get_args(struct dm_target *ti, struct sadc_c *sc,
                 return false;
         }
         sc->cache_percent = tmp;
+
+        if (sscanf(argv[4], "%llu%c", &tmp, &dummy) != 1 ||
+            tmp < MIN_DISK_SIZE || tmp > MAX_DISK_SIZE) {
+                ti->error = "dm-sadc: Invalid disk size.";
+                return false;
+        }
+        sc->disk_size = tmp;
+
         return true;
 }
 
@@ -284,7 +293,7 @@ static void debug_print(struct sadc_c *sc)
 {
         DMERR("Constructing...");
         DMERR("Device: %s",                  sc->dev->name);
-        DMERR("Total disk size: %Lu bytes",  sc->total_size);
+        DMERR("Disk size: %Lu bytes",        sc->disk_size);
         DMERR("Band size: %Lu bytes",        sc->band_size);
         DMERR("Band size: %d pbas",          sc->band_size_pbas);
         DMERR("Total number of bands: %d",   sc->num_bands);
@@ -298,10 +307,9 @@ static void debug_print(struct sadc_c *sc)
 
 static void calc_params(struct sadc_c *sc)
 {
-        sc->total_size      = TOTAL_SIZE;
         sc->band_size       = sc->band_size_tracks * sc->track_size;
         sc->band_size_pbas  = sc->band_size / PBA_SIZE;
-        sc->num_bands       = sc->total_size / sc->band_size;
+        sc->num_bands       = sc->disk_size / sc->band_size;
         sc->num_cache_bands = sc->num_bands * sc->cache_percent / 100;
         sc->cache_size      = sc->num_cache_bands * sc->band_size;
 
@@ -312,7 +320,7 @@ static void calc_params(struct sadc_c *sc)
 
         sc->cache_assoc     = sc->num_data_bands / sc->num_cache_bands;
         sc->usable_size     = sc->num_data_bands * sc->band_size;
-        sc->wasted_size     = sc->total_size - sc->cache_size - sc->usable_size;
+        sc->wasted_size     = sc->disk_size - sc->cache_size - sc->usable_size;
         sc->num_valid_pbas  = (sc->usable_size + sc->cache_size) / PBA_SIZE;
         sc->num_usable_pbas = sc->usable_size / PBA_SIZE;
 

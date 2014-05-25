@@ -17,11 +17,10 @@ const (
 	lbaSize        = 512
 
 	moduleName   = "sadc"
-	rootDir      = "/home/aghayev/shingle/"
 	loopDevice   = "/dev/loop0"
-	fileName     = rootDir + moduleName + ".img"
+	fileName     = moduleName + ".img"
 	fileSize     = diskSize
-	modulePath   = rootDir + "dm-" + moduleName + ".ko"
+	modulePath   = "dm-" + moduleName + ".ko"
 	moduleRmName = "dm_" + moduleName
 	targetName   = moduleName
 )

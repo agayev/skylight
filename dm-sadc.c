@@ -291,7 +291,6 @@ static bool get_args(struct dm_target *ti, struct sadc_c *sc,
 
 static void debug_print(struct sadc_c *sc)
 {
-        DMERR("Constructing...");
         DMERR("Device: %s",                  sc->dev->name);
         DMERR("Disk size: %Lu bytes",        sc->disk_size);
         DMERR("Band size: %Lu bytes",        sc->band_size);

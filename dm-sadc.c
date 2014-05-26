@@ -36,6 +36,9 @@
 
 #define DM_MSG_PREFIX "sadc"
 
+/* Disk state reset IOCTL command. */
+#define RESET_DISK 0xDEADBEEF
+
 /*
  * This code assumes that maximum segment size in a bio is equal to PAGE_SIZE,
  * which is equal to 4096 bytes.  Things may break if this is not the case.
@@ -78,6 +81,12 @@ enum state {
 struct sadc_c {
         struct dm_dev *dev;
         int64_t disk_size;
+
+        /*
+         * Control access to context.  Currently, this is only used when we want
+         * to reset the disk while GC is happening.
+         */
+        struct mutex c_lock;
 
         /* Percentage of space used for cache region. */
         int32_t cache_percent;
@@ -332,6 +341,26 @@ static void reset_cache_band(struct sadc_c *sc, struct cache_band *cb)
         bitmap_zero(cb->map, sc->cache_assoc);
 }
 
+static int reset_disk(struct sadc_c *sc)
+{
+        int i;
+
+        DMERR("Resetting disk...");
+
+        if (!mutex_trylock(&sc->c_lock)) {
+                DMERR("Cannot reset -- GC in progres...");
+                return -EIO;
+        }
+
+        for (i = 0; i < sc->num_cache_bands; i++)
+                reset_cache_band(sc, &sc->cache_bands[i]);
+        memset(sc->pba_map, -1, sizeof(int32_t) * sc->num_usable_pbas);
+
+        mutex_unlock(&sc->c_lock);
+
+        return 0;
+}
+
 static bool alloc_structs(struct sadc_c *sc)
 {
         int32_t i, size, pba;
@@ -424,6 +453,8 @@ static int sadc_ctr(struct dm_target *ti, unsigned int argc, char **argv)
                 ti->error = "dm-sadc: Device lookup failed.";
                 return -1;
         }
+
+        mutex_init(&sc->c_lock);
 
         debug_print(sc);
 
@@ -976,6 +1007,8 @@ static void do_gc_complete(struct sadc_c *sc)
                 sc->state = STATE_NONE;
                 queue_io(sc->pending_io);
                 sc->pending_io = NULL;
+
+                mutex_unlock(&sc->c_lock);
         } else {
                 sc->state = STATE_START_GC;
         }
@@ -988,6 +1021,8 @@ static void do_fail_gc(struct sadc_c *sc, int error)
         sc->state = STATE_NONE;
         sc->pending_io = NULL;
         sc->gc_cache_band = NULL;
+
+        mutex_unlock(&sc->c_lock);
 
         io->error = error;
         DMERR("Failing GC.");
@@ -1048,6 +1083,9 @@ static void start_gc(struct sadc_c *sc, struct io *io)
 {
         DMERR("Starting gc for bio");
         DBG(io->bio, 0);
+
+        mutex_lock(&sc->c_lock);
+
         sc->pending_io = io;
         sc->state = STATE_START_GC;
         gc(sc, 0);
@@ -1094,6 +1132,15 @@ static int sadc_map(struct dm_target *ti, struct bio *bio)
         return DM_MAPIO_SUBMITTED;
 }
 
+static int sadc_ioctl(struct dm_target *ti, unsigned int cmd, unsigned long arg)
+{
+        struct sadc_c *sc = ti->private;
+
+        if (cmd == RESET_DISK)
+                return reset_disk(sc);
+        return -EINVAL;
+}
+
 static void sadc_status(struct dm_target *ti, status_type_t type,
                            unsigned status_flags, char *result, unsigned maxlen)
 {
@@ -1122,6 +1169,7 @@ static struct target_type sadc_target = {
         .dtr    = sadc_dtr,
         .map    = sadc_map,
         .status = sadc_status,
+        .ioctl  = sadc_ioctl,
 };
 
 static int __init dm_sadc_init(void)

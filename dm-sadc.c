@@ -60,12 +60,27 @@
 #define pba_to_lba(pba) (((sector_t) pba) * LBAS_IN_PBA)
 
 #define DBG(bio, error)                                  \
-        DMERR("%s %c %d [%lu] %u",                       \
+        DMERR("%s %c %d [%lu] %u vcnt: %hu idx: %hu",    \
               (error ? "!!" : "OK"),                     \
               (bio_data_dir(bio) == READ ? 'R' : 'W'),   \
               lba_to_pba(bio->bi_sector),                \
               bio->bi_sector,                            \
-              bio->bi_size / LBA_SIZE)
+              bio->bi_size / LBA_SIZE,                   \
+              bio->bi_vcnt,                              \
+              bio->bi_idx)
+
+static inline void FULL_DBG(struct bio *bio, int error)
+{
+        int i;
+        unsigned long flags;
+        struct bio_vec *bv;
+
+        DBG(bio, error);
+        bio_for_each_segment(bv, bio, i) {
+                DMERR("segment %d: address %p, len %u, offset %u",
+                      i, bvec_kmap_irq(bv, &flags), bv->bv_len, bv->bv_offset);
+        }
+}
 
 enum state {
         STATE_START_GC,
@@ -677,7 +692,6 @@ static void init_bio(struct io *io, struct bio *bio,
         bio->bi_private = io;
         bio->bi_end_io = endio;
         bio->bi_idx = idx;
-        bio->bi_vcnt = vcnt;
         bio->bi_sector = sector;
         bio->bi_size = vcnt * PAGE_SIZE;
         bio->bi_bdev = sc->dev->bdev;

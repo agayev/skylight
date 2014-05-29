@@ -1,0 +1,5 @@
+# Before any writes, reads should go to unmapped.
+r _ 0 1,r _ 1 1,r _ 2 1,r _ 3 1,r _ 4 1,r _ 5 1,r _ 6 1,r _ 7 1,r _ 8 1,r _ 9 1,r _ 10 1,r _ 11 1:r 0 1,r 1 1,r 2 1,r 3 1,r 4 1,r 5 1,r 6 1,r 7 1,r 8 1,r 9 1,r 10 1,r 11 1
+
+# Read all of blocks in a single read operation.  This test caught a bug.
+r _ 0 12:r 0 12

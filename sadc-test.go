@@ -49,11 +49,6 @@ func numUsableSectors() int {
 	return numDataBands * bandSize / lbaSize
 }
 
-type Cmd struct {
-	c *exec.Cmd
-	s string
-}
-
 // |cmdLine| is a shell command that may include pipes.  Returns the slice of
 // |exec.Command| objects all of which have been started with the exception of
 // the last one.

@@ -127,7 +127,7 @@ func tearDown() {
 }
 
 // Allocates aligned blocks for direct I/O.
-func alignedBlocks(c byte, count int) []byte {
+func alignedBlocks(count int, pattern string) []byte {
 	b := make([]byte, pageSize+blockSize*count)
 	a := int(uintptr(unsafe.Pointer(&b[0])) & (pageSize - 1))
 
@@ -137,15 +137,17 @@ func alignedBlocks(c byte, count int) []byte {
 	}
 	b = b[o:o+blockSize*count]
 
-	for i := range b {
-		b[i] = c
+	for i := 0; i < count; i++ {
+		for j := 0; j < blockSize; j++ {
+			b[i*blockSize+j] = pattern[i]
+		}
 	}
 	return b
 }
 
 // Writes |count| number of blocks filled with |c|, starting at |blockNo|.
-func writeBlocks(f *os.File, blockNo, count int, c byte) {
-	b := alignedBlocks(c, count)
+func writeBlocks(f *os.File, blockNo, count int, pattern string) {
+	b := alignedBlocks(count, pattern)
 
 	offset := int64(blockNo * blockSize)
 	if _, err := f.WriteAt(b, offset); err != nil {
@@ -155,19 +157,21 @@ func writeBlocks(f *os.File, blockNo, count int, c byte) {
 
 // Reads |count| number of blocks starting at |blockNo| and verifies that the
 // read blocks are filled with |c|.
-func readBlocks(f *os.File, blockNo, count int, c byte) {
-	b := alignedBlocks(0, count)
+func readBlocks(f *os.File, blockNo, count int, pattern string) {
+	b := alignedBlocks(count, strings.Repeat("!", count))
 
 	offset := int64(blockNo * blockSize)
 	if _, err := f.ReadAt(b, offset); err != nil {
 		panicf("Read failed: %v", err)
 	}
-	if c == '_' {
-		return
-	}
-	for i := range b {
-		if b[i] != c {
-			panicf("Expected %c, got %c", c, b[i])
+	for i := 0; i < count; i++ {
+		if pattern[i] == '_' {
+			continue
+		}
+		for j := 0; j < blockSize; j++ {
+			if b[i*blockSize+j] != pattern[i] {
+				panicf("Expected %c, got %c", pattern[i], b[i])
+			}
 		}
 	}
 }
@@ -196,13 +200,18 @@ type Test struct {
 
 // Verifies syntax of the tests.
 func verify(tests []*Test) {
-	var userCmdRegexp = regexp.MustCompile(`^[wr]\s[a-z_]\s\d+\s\d+$`)
+	var userCmdRegexp = regexp.MustCompile(`^[wr]\s[a-z_]+\s\d+\s\d+$`)
 	var btEventRegexp = regexp.MustCompile(`^[wr]\s\d+\s\d+$`)
 
 	fmt.Println("Verifying syntax of tests...")
 	for i, t := range tests {
 		for _, c := range strings.Split(t.userCmds, ",") {
 			if !userCmdRegexp.MatchString(c) {
+				panicf("Bad user command %d: %s", i, c)
+			}
+			f := strings.Fields(c)
+			n, _ := strconv.Atoi(f[3])
+			if len(f[1]) != n {
 				panicf("Bad user command %d: %s", i, c)
 			}
 		}
@@ -217,14 +226,14 @@ func verify(tests []*Test) {
 // Executes a user test command.
 func doUserCmd(f *os.File, cmd string) {
 	fs := strings.Fields(cmd)
-	op, c := fs[0], fs[1][0]
+	operation, pattern := fs[0], fs[1]
 	offset, _ := strconv.Atoi(fs[2])
 	count, _ := strconv.Atoi(fs[3])
 
-	if op == "w" {
-		writeBlocks(f, offset, count, c)
+	if operation == "w" {
+		writeBlocks(f, offset, count, pattern)
 	} else {
-		readBlocks(f, offset, count, c)
+		readBlocks(f, offset, count, pattern)
 	}
 }
 

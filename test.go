@@ -126,16 +126,16 @@ func tearDown() {
 	runCmd("rm " + fileName)
 }
 
-// Allocates aligned block for direct I/O.
-func alignedBlock(c byte) []byte {
-	b := make([]byte, pageSize+blockSize)
+// Allocates aligned blocks for direct I/O.
+func alignedBlocks(c byte, count int) []byte {
+	b := make([]byte, pageSize+blockSize*count)
 	a := int(uintptr(unsafe.Pointer(&b[0])) & (pageSize - 1))
 
 	o := 0
 	if a != 0 {
 		o = pageSize - a
 	}
-	b = b[o : o+pageSize]
+	b = b[o:o+blockSize*count]
 
 	for i := range b {
 		b[i] = c
@@ -145,33 +145,29 @@ func alignedBlock(c byte) []byte {
 
 // Writes |count| number of blocks filled with |c|, starting at |blockNo|.
 func writeBlocks(f *os.File, blockNo, count int, c byte) {
-	b := alignedBlock(c)
+	b := alignedBlocks(c, count)
 
-	for i := 0; i < count; i++ {
-		offset := int64(blockNo * blockSize)
-		if _, err := f.WriteAt(b, offset); err != nil {
-			panicf("Write failed: %v", err)
-		}
+	offset := int64(blockNo * blockSize)
+	if _, err := f.WriteAt(b, offset); err != nil {
+		panicf("Write failed: %v", err)
 	}
 }
 
 // Reads |count| number of blocks starting at |blockNo| and verifies that the
 // read blocks are filled with |c|.
 func readBlocks(f *os.File, blockNo, count int, c byte) {
-	b := alignedBlock(0)
+	b := alignedBlocks(0, count)
 
-	for i := 0; i < count; i++ {
-		offset := int64(blockNo * blockSize)
-		if _, err := f.ReadAt(b, offset); err != nil {
-			panicf("Read failed: %v", err)
-		}
-		if c == '_' {
-			return
-		}
-		for i := range b {
-			if b[i] != c {
-				panicf("Expected %c, got %c", c, b[i])
-			}
+	offset := int64(blockNo * blockSize)
+	if _, err := f.ReadAt(b, offset); err != nil {
+		panicf("Read failed: %v", err)
+	}
+	if c == '_' {
+		return
+	}
+	for i := range b {
+		if b[i] != c {
+			panicf("Expected %c, got %c", c, b[i])
 		}
 	}
 }

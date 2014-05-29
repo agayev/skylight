@@ -571,7 +571,7 @@ static bool contiguous(struct sadc_c *sc, struct bio *bio)
         sector_t base = bio->bi_sector;
         int i;
 
-        for (i = 0; i < bio_pbas(bio) - 1; ++i, base += LBAS_IN_PBA) {
+        for (i = 0; i < bio_pbas(bio) - 1; ++i) {
                 sector_t curr = lookup_lba(sc, base + i * LBAS_IN_PBA);
                 sector_t next = lookup_lba(sc, base + (i+1) * LBAS_IN_PBA);
                 if (curr + LBAS_IN_PBA != next)

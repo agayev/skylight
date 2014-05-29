@@ -7,7 +7,7 @@ all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 test:
-	go run $(module)-test.go
+	go run test.go -f $(module).test
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

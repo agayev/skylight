@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -195,7 +196,7 @@ type Test struct {
 }
 
 // Verifies syntax of the tests.
-func verify(tests []Test) {
+func verify(tests []*Test) {
 	var userCmdRegexp = regexp.MustCompile(`^[wr]\s[a-z]\s\d+\s\d+$`)
 	var btEventRegexp = regexp.MustCompile(`^[wr]\s\d+\s\d+$`)
 
@@ -280,7 +281,7 @@ func eventsMatch(expectedEvents, readEvents []string) bool {
 	return true
 }
 
-func doTest(i int, t Test) {
+func doTest(i int, t *Test) {
 	f, err := os.OpenFile(targetDevice, os.O_RDWR|syscall.O_DIRECT, 0666)
 	if err != nil {
 		panicf("os.OpenFile(%s) failed: %v", targetDevice, err)
@@ -324,15 +325,33 @@ func doTest(i int, t Test) {
 	}
 }
 
+func readTests(fileName string) (tests []*Test) {
+	f, err := os.Open(fileName)
+	if err != nil {
+		panicf("os.Open(%s) failed: %s\n", fileName, err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		s := scanner.Text()
+		f := strings.Split(s, ":")
+		tests = append(tests, &Test{f[0], f[1]})
+	}
+	return
+}
+
 func main() {
-	var tests []Test
+	testFile := flag.String("f", "", "File containig tests.")
 
-	tests = append(tests, Test{userCmds: "w a 0 1,w b 0 1,w c 0 1,r c 0 1", btEvents: "w 12 1,w 13 1,w 14 1,r 14 1"})
-	tests = append(tests, Test{userCmds: "w a 0 1,w b 0 1,w c 0 1,r c 0 1", btEvents: "w 12 1,w 13 1,w 14 1,r 14 1"})
-	tests = append(tests, Test{userCmds: "w a 0 1,w b 0 1,w c 0 1,r c 0 1", btEvents: "w 12 1,w 13 1,w 14 1,r 14 1"})
-	tests = append(tests, Test{userCmds: "w a 0 1,w b 0 1,w c 0 1,r c 0 1", btEvents: "w 12 1,w 13 1,w 14 1,r 14 1"})
-	tests = append(tests, Test{userCmds: "w a 0 1,w b 0 1,w c 0 1,r c 0 1", btEvents: "w 12 1,w 13 1,w 14 1,r 14 1"})
+	flag.Parse()
 
+	if *testFile == "" {
+		fmt.Println("Please specify a test file using -f")
+		return
+	}
+
+	tests := readTests(*testFile)
 	verify(tests)
 
 	setup()

@@ -647,10 +647,24 @@ static void remap(struct sadc_c *sc, struct bio *bio)
 {
         bio->bi_bdev = sc->dev->bdev;
 
-        if (bio_data_dir(bio) == READ)
+        if (bio_data_dir(bio) == READ) {
                 bio->bi_sector = lookup_lba(sc, bio->bi_sector);
-        else
+        } else {
+                /*
+                 * Since the write is contiguous, it is enough to update the
+                 * sector of the bio for it to proceed.  In the case of bios
+                 * with multiple segments, we need to update our internal map as
+                 * well, therefore we execute map_lba for the remaining pbas for
+                 * the side effect of updating |sc->pba_map|.
+                 */
+                int i;
+                sector_t base = bio->bi_sector;
+
                 bio->bi_sector = map_lba(sc, bio->bi_sector);
+
+                for (i = 1; i < bio_pbas(bio); ++i)
+                        map_lba(sc, base + i * LBAS_IN_PBA);
+        }
 
         DBG(bio, 0);
 }

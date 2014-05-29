@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	resetDisk = 0xDEADBEEF
+	retryCount = 3
 
+	resetDisk      = 0xDEADBEEF
 	diskSize       = 76 << 10
 	trackSize      = 4096
 	pageSize       = 4096
@@ -135,7 +136,7 @@ func alignedBlocks(count int, pattern string) []byte {
 	if a != 0 {
 		o = pageSize - a
 	}
-	b = b[o:o+blockSize*count]
+	b = b[o : o+blockSize*count]
 
 	for i := 0; i < count; i++ {
 		for j := 0; j < blockSize; j++ {
@@ -238,7 +239,7 @@ func doUserCmd(f *os.File, cmd string) {
 }
 
 // Reads blktrace events from |pipe|.
-func readBtEvents(pipe io.ReadCloser, ch chan []string) {
+func readBtEvents(pipe io.ReadCloser, ch chan []string, count int) {
 	var events []string
 	go func() {
 		scanner := bufio.NewScanner(pipe)
@@ -250,9 +251,19 @@ func readBtEvents(pipe io.ReadCloser, ch chan []string) {
 			events = append(events, s)
 		}
 	}()
+
+	// Try to read one more than needed to detect invalid tests that produce
+	// more events than we expect.
+	count++
+
+	i := 0
 	for {
 		time.Sleep(1 * time.Second)
-		if len(events) != 0 {
+		if len(events) == count {
+			break
+		}
+		i++
+		if i == retryCount {
 			break
 		}
 	}
@@ -306,8 +317,10 @@ func doTest(i int, t *Test) {
 
 	fmt.Printf("Running test %3d: ", i)
 
+	expectedEvents := strings.Split(t.btEvents, ",")
+
 	ch := make(chan []string)
-	go readBtEvents(pipe, ch)
+	go readBtEvents(pipe, ch, len(expectedEvents))
 
 	// Although at this point blktrace has already started running, there is
 	// a race between blktrace issuing BLKTRACESETUP to the loopback device
@@ -321,7 +334,6 @@ func doTest(i int, t *Test) {
 
 	readEvents := <-ch
 	close(ch)
-	expectedEvents := strings.Split(t.btEvents, ",")
 
 	if eventsMatch(expectedEvents, readEvents) {
 		fmt.Println("ok")

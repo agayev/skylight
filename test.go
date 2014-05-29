@@ -165,6 +165,9 @@ func readBlocks(f *os.File, blockNo, count int, c byte) {
 		if _, err := f.ReadAt(b, offset); err != nil {
 			panicf("Read failed: %v", err)
 		}
+		if c == '_' {
+			return
+		}
 		for i := range b {
 			if b[i] != c {
 				panicf("Expected %c, got %c", c, b[i])
@@ -197,7 +200,7 @@ type Test struct {
 
 // Verifies syntax of the tests.
 func verify(tests []*Test) {
-	var userCmdRegexp = regexp.MustCompile(`^[wr]\s[a-z]\s\d+\s\d+$`)
+	var userCmdRegexp = regexp.MustCompile(`^[wr]\s[a-z_]\s\d+\s\d+$`)
 	var btEventRegexp = regexp.MustCompile(`^[wr]\s\d+\s\d+$`)
 
 	fmt.Println("Verifying syntax of tests...")
@@ -335,6 +338,9 @@ func readTests(fileName string) (tests []*Test) {
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		s := scanner.Text()
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
 		f := strings.Split(s, ":")
 		tests = append(tests, &Test{f[0], f[1]})
 	}

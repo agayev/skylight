@@ -59,26 +59,26 @@
 #define lba_to_pba(lba) ((int32_t) (lba / LBAS_IN_PBA))
 #define pba_to_lba(pba) (((sector_t) pba) * LBAS_IN_PBA)
 
-#define DBG(bio, error)                                  \
-        DMERR("%s %c %d [%lu] %u vcnt: %hu idx: %hu",    \
+static inline void DBG(struct bio *bio, int error)
+{
+        int i;
+        struct bio_vec *bv;
+        unsigned long flags;
+
+        DMERR("%s %c %d %u [%lu] vcnt: %hu idx: %hu",    \
               (error ? "!!" : "OK"),                     \
               (bio_data_dir(bio) == READ ? 'R' : 'W'),   \
               lba_to_pba(bio->bi_sector),                \
+              bio->bi_size / PBA_SIZE,                   \
               bio->bi_sector,                            \
-              bio->bi_size / LBA_SIZE,                   \
               bio->bi_vcnt,                              \
-              bio->bi_idx)
+              bio->bi_idx);
 
-static inline void FULL_DBG(struct bio *bio, int error)
-{
-        int i;
-        unsigned long flags;
-        struct bio_vec *bv;
-
-        DBG(bio, error);
         bio_for_each_segment(bv, bio, i) {
-                DMERR("segment %d: address %p, len %u, offset %u",
-                      i, bvec_kmap_irq(bv, &flags), bv->bv_len, bv->bv_offset);
+                char *addr = bvec_kmap_irq(bv, &flags);
+                DMERR("segment %d: addr: %p len: %u offset: %u char [%d]",
+                      i, addr, bv->bv_len, bv->bv_offset, *addr);
+                bvec_kunmap_irq(addr, &flags);
         }
 }
 

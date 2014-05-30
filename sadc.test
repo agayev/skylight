@@ -1,49 +1,55 @@
-# ################################################################################
-# #
-# # Fast operations -- these operations complete with a simple remap of the
-# # initial sector.  They do not exercise most of the code paths inside the
-# # target.
-# #
-# ################################################################################
+################################################################################
+#
+# Fast operations -- these operations complete with a simple remap of the
+# initial sector.  They do not exercise most of the code paths inside the
+# target.
+#
+################################################################################
 
-# # Before any writes, reads should go to unmapped.
-# r _ 0 1,r _ 1 1,r _ 2 1,r _ 3 1,r _ 4 1,r _ 5 1,r _ 6 1,r _ 7 1,r _ 8 1,r _ 9 1,r _ 10 1,r _ 11 1:r 0 1,r 1 1,r 2 1,r 3 1,r 4 1,r 5 1,r 6 1,r 7 1,r 8 1,r 9 1,r 10 1,r 11 1
+# Before any writes, reads should go to unmapped.
+r _ 0 1,r _ 1 1,r _ 2 1,r _ 3 1,r _ 4 1,r _ 5 1,r _ 6 1,r _ 7 1,r _ 8 1,r _ 9 1,r _ 10 1,r _ 11 1:r 0 1,r 1 1,r 2 1,r 3 1,r 4 1,r 5 1,r 6 1,r 7 1,r 8 1,r 9 1,r 10 1,r 11 1
 
-# # Read all of blocks in a single read operation.
-# r ____________ 0 12:r 0 12
+# Read all of blocks in a single read operation.
+r ____________ 0 12:r 0 12
 
-# # Write as much as possible without causing GC, one block at a time.  Also
-# # verify the contents.
-# w a 0 1,w b 1 1,w c 2 1,w d 3 1,w e 4 1,w f 5 1,r a 0 1,r b 1 1,r c 2 1,r d 3 1,r e 4 1,r f 5 1:w 12 1,w 13 1,w 14 1,w 15 1,w 16 1,w 17 1,r 12 1,r 13 1,r 14 1,r 15 1,r 16 1,r 17 1
+# Write as much as possible without causing GC, one block at a time.  Also
+# verify the contents.
+w a 0 1,w b 1 1,w c 2 1,w d 3 1,w e 4 1,w f 5 1,r a 0 1,r b 1 1,r c 2 1,r d 3 1,r e 4 1,r f 5 1:w 12 1,w 13 1,w 14 1,w 15 1,w 16 1,w 17 1,r 12 1,r 13 1,r 14 1,r 15 1,r 16 1,r 17 1
 
-# # Write as much as possible without causing GC, in as big chunks as possible.
-# # Also verify the contents.
-# w aaa 0 3,w bbb 3 3,r aaa 0 3,r bbb 3 3:w 12 3,w 15 3,r 12 3,r 15 3
+# Write as much as possible without causing GC, in as big chunks as possible.
+# Also verify the contents.
+w aaa 0 3,w bbb 3 3,r aaa 0 3,r bbb 3 3:w 12 3,w 15 3,r 12 3,r 15 3
 
-# # Write as much as possible without causing GC, one block at a time, for
-# # non-contiguous bands.  Also verify the contents.
-# w a 3 1,w b 4 1,w c 5 1,w d 6 1,w e 7 1,w f 8 1,r a 3 1,r b 4 1,r c 5 1,r d 6 1,r e 7 1,r f 8 1:w 15 1,w 16 1,w 17 1,w 12 1,w 13 1,w 14 1,r 15 1,r 16 1,r 17 1,r 12 1,r 13 1,r 14 1
+# Write as much as possible without causing GC, one block at a time, for
+# non-contiguous bands.  Also verify the contents.
+w a 3 1,w b 4 1,w c 5 1,w d 6 1,w e 7 1,w f 8 1,r a 3 1,r b 4 1,r c 5 1,r d 6 1,r e 7 1,r f 8 1:w 15 1,w 16 1,w 17 1,w 12 1,w 13 1,w 14 1,r 15 1,r 16 1,r 17 1,r 12 1,r 13 1,r 14 1
 
-# # # Write as much as possible without causing GC, in as big chunks as possible,
-# # # for non-contiguous bands.  Also verify the contents.
-# w aaa 3 3,w bbb 6 3,r aaa 3 3,r bbb 6 3:w 15 3,w 12 3,r 15 3,r 12 3
+# # Write as much as possible without causing GC, in as big chunks as possible,
+# # for non-contiguous bands.  Also verify the contents.
+w aaa 3 3,w bbb 6 3,r aaa 3 3,r bbb 6 3:w 15 3,w 12 3,r 15 3,r 12 3
 
-# ################################################################################
-# #
-# # Slow operations -- these operations break contiguity therefore cannot complete
-# # with a remap.  So we get to exercise the code that splits non-contiguous bios.
-# # The operations here do not cause GC.
-# #
-# ################################################################################
+################################################################################
+#
+# Slow operations -- these operations break contiguity therefore cannot complete
+# with a remap.  So we get to exercise the code that splits non-contiguous bios.
+# The operations here do not cause GC.
+#
+################################################################################
 
-# # Write to the beginning of the band and read all of the band, one block.
-# w a 0 1,r a__ 0 3:w 12 1,r 12 1,r 1 2
+# Write to the beginning of the band and read all of the band, one block.
+w a 0 1,r a__ 0 3:w 12 1,r 12 1,r 1 2
 
-# # Write to the beginning of the band and read all of the band, two blocks.
-# w ab 0 2,r ab_ 0 3:w 12 2,r 12 2,r 2 1
+# Write to the beginning of the band and read all of the band, two blocks.
+w ab 0 2,r ab_ 0 3:w 12 2,r 12 2,r 2 1
 
-# # Write to the end of the band and read all of the band, one block.
-# w a 2 1,r __a 0 3:w 12 1,r 0 2,r 12 1
+# Write to the end of the band and read all of the band, one block.
+w a 2 1,r __a 0 3:w 12 1,r 0 2,r 12 1
 
 # Write to the end of the band and read all of the band, two blocks.
 w ab 1 2,r _ab 0 3:w 12 2,r 0 1,r 12 2
+
+# Write a single block to the middle of the band and read all of the band.
+w a 1 1,r _a_ 0 3:w 12 1,r 0 1,r 12 1,r 2 1
+
+# Write to the beginning of every band and read all disk.
+w a 0 1,w b 3 1,w c 6 1,w d 9 1,r a__b__c__d__ 0 12:w 12 1,w 15 1,w 13 1,w 16 1,r 12 1,r 1 2,r 15 1,r 4 2,r 13 1,r 7 2,r 16 1,r 10 2

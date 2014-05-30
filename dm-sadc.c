@@ -823,8 +823,6 @@ static void complete_delayed_io(struct sadc_c *sc, struct io *io, split_f split)
 }
 
 /*
- * Worker thread entry point.
- *
  * There are different kinds of writes each of which needs special
  * handling.  Starting from the simplest, these are the following:
  *
@@ -1119,6 +1117,9 @@ static void start_gc(struct sadc_c *sc, struct io *io)
         gc(sc, 0);
 }
 
+/*
+ * Worker thread entry point.
+ */
 static void sadcd(struct work_struct *work)
 {
         struct io *io = container_of(work, struct io, work);

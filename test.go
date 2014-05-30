@@ -262,7 +262,7 @@ func readBtEvents(pipe io.ReadCloser, ch chan []string, count int) {
 			if !strings.HasPrefix(s, "!") {
 				continue
 			}
-			events = append(events, s)
+			events = append(events, btToTest(s))
 		}
 	}()
 
@@ -307,7 +307,7 @@ func eventsMatch(expectedEvents, readEvents []string) bool {
 		return false
 	}
 	for i := range expectedEvents {
-		if expectedEvents[i] != btToTest(readEvents[i]) {
+		if expectedEvents[i] != readEvents[i] {
 			return false
 		}
 	}

@@ -109,7 +109,7 @@ func setup() {
 	runCmd("make clean")
 	runCmd("make")
 	runCmd("sudo insmod " + modulePath)
-	runCmd("fallocate -l " + strconv.Itoa(fileSize) + " " + fileName)
+	runCmd("fallocate -l " + strconv.Itoa(2 * fileSize) + " " + fileName)
 	runCmd("sudo losetup " + loopDevice + " " + fileName)
 
 	c := fmt.Sprintf("echo 0 %d %s %s %d %d %d %d | sudo dmsetup create %s",
@@ -177,17 +177,31 @@ func readBlocks(f *os.File, blockNo, count int, pattern string) {
 	}
 }
 
-// Sends IOCTL to SMR emulator target to reset its state.
+// Sends IOCTL to SMR emulator target to reset its state.  Also, overwrite the
+// underlying file with zeroes.
 func doResetDisk() {
-	f, err := os.Open(targetDevice)
+	d, err := os.Open(targetDevice)
 	if err != nil {
-		panicf("os.OpenFile(%s) failed: %v", targetDevice, err)
+		panicf("os.Open(%s) failed: %v", targetDevice, err)
+	}
+	defer d.Close()
+
+	_, _, errr := syscall.Syscall(syscall.SYS_IOCTL, d.Fd(), resetDisk, 0)
+	if errr != 0 {
+		panicf("Resetting %s failed: %v", targetDevice, errr)
+	}
+
+	f, err := os.OpenFile(fileName, os.O_RDWR|syscall.O_DIRECT, 0666)
+	if err != nil {
+		panicf("os.OpenFile(%s) failed: %v", fileName, err)
 	}
 	defer f.Close()
 
-	_, _, errr := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), resetDisk, 0)
-	if errr != 0 {
-		panicf("Resetting %s failed: %v", targetDevice, errr)
+	b := alignedBlocks(1, "\x00")
+	for i := 0; i < diskSize / blockSize; i++ {
+		if _, err := f.Write(b); err != nil {
+			panicf("Failed to write to %s: %v", fileName,err)
+		}
 	}
 }
 

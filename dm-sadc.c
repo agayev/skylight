@@ -367,7 +367,7 @@ static int reset_disk(struct sadc_c *sc)
                 return -EIO;
         }
 
-        for (i = 0; i < sc->num_cache_bands; i++)
+        for (i = 0; i < sc->num_cache_bands; ++i)
                 reset_cache_band(sc, &sc->cache_bands[i]);
         memset(sc->pba_map, -1, sizeof(int32_t) * sc->num_usable_pbas);
 
@@ -576,6 +576,16 @@ static sector_t map_lba(struct sadc_c *sc, sector_t lba)
         WARN_ON(!(sc->num_usable_pbas <= mpba && mpba < sc->num_valid_pbas));
 
         return pba_to_lba(mpba);
+}
+
+static void clear_pba_map_for_rmw_band(struct sadc_c *sc)
+{
+        int32_t i, pba = sc->rmw_data_band * sc->band_size_pbas;
+
+        WARN_ON(sc->rmw_data_band == -1);
+
+        for (i = 0; i < sc->band_size_pbas; ++i)
+                sc->pba_map[pba + i] = -1;
 }
 
 #define bio_pbas bio_segments
@@ -1010,6 +1020,7 @@ static int do_rmw_complete(struct sadc_c *sc, int error)
 
         i = band_to_bit(sc, cb, sc->rmw_data_band);
         clear_bit(i, cb->map);
+        clear_pba_map_for_rmw_band(sc);
         sc->rmw_data_band = -1;
 
         if (bitmap_weight(cb->map, sc->cache_assoc))

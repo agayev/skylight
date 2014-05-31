@@ -90,6 +90,41 @@ w def 9 3,w abc 6 3,r ______abcdef 0 12:w 15 3,w 12 3,r 0 6,r 12 6
 
 ################################################################################
 #
-# GC operations -- these operations do everything above, plus they cause GC.
+# Single-band GC operations -- these operations do everything above, plus they
+# cause GC that results in RMW of a single band.
 #
 ################################################################################
+
+# Simplest GC test.  Fill each band one block at a time and do another block
+# write at the first block of the band.
+w a 0 1,w b 1 1,w c 2 1,w d 0 1,r dbc_ 0 4:w 12 1,w 13 1,w 14 1,r 0 1,r 1 1,r 2 1,r 12 1,r 13 1,r 14 1,w 0 1,w 1 1,w 2 1,w 12 1,r 12 1,r 1 3
+w a 3 1,w b 4 1,w c 5 1,w d 3 1,r ___dbc_ 0 7:w 15 1,w 16 1,w 17 1,r 3 1,r 4 1,r 5 1,r 15 1,r 16 1,r 17 1,w 3 1,w 4 1,w 5 1,w 15 1,r 0 3,r 15 1,r 4 3
+w a 6 1,w b 7 1,w c 8 1,w d 6 1,r ______dbc_ 0 10:w 12 1,w 13 1,w 14 1,r 6 1,r 7 1,r 8 1,r 12 1,r 13 1,r 14 1,w 6 1,w 7 1,w 8 1,w 12 1,r 0 6,r 12 1,r 7 3
+w a 9 1,w b 10 1,w c 11 1,w d 9 1,r _________dbc 0 12:w 15 1,w 16 1,w 17 1,r 9 1,r 10 1,r 11 1,r 15 1,r 16 1,r 17 1,w 9 1,w 10 1,w 11 1,w 15 1,r 0 9,r 15 1,r 10 2
+
+# Same as above, but fill the band at once.
+w abc 0 3,w d 0 1,r dbc_ 0 4:w 12 3,r 0 1,r 1 1,r 2 1,r 12 1,r 13 1,r 14 1,w 0 1,w 1 1,w 2 1,w 12 1,r 12 1,r 1 3
+w abc 3 3,w d 3 1,r ___dbc_ 0 7:w 15 3,r 3 1,r 4 1,r 5 1,r 15 1,r 16 1,r 17 1,w 3 1,w 4 1,w 5 1,w 15 1,r 0 3,r 15 1,r 4 3
+w abc 6 3,w d 6 1,r ______dbc_ 0 10:w 12 3,r 6 1,r 7 1,r 8 1,r 12 1,r 13 1,r 14 1,w 6 1,w 7 1,w 8 1,w 12 1,r 0 6,r 12 1,r 7 3
+w abc 9 3,w d 9 1,r _________dbc 0 12:w 15 3,r 9 1,r 10 1,r 11 1,r 15 1,r 16 1,r 17 1,w 9 1,w 10 1,w 11 1,w 15 1,r 0 9,r 15 1,r 10 2
+
+# Fill each band at once, then write to another band that shares the cache band
+# and read all disk.
+w abc 0 3,w d 6 1,r abc___d_ 0 8:w 12 3,r 0 1,r 1 1,r 2 1,r 12 1,r 13 1,r 14 1,w 0 1,w 1 1,w 2 1,w 12 1,r 0 6,r 12 1,r 7 1
+w abc 3 3,w d 9 1,r ___abc___d__ 0 12:w 15 3,r 3 1,r 4 1,r 5 1,r 15 1,r 16 1,r 17 1,w 3 1,w 4 1,w 5 1,w 15 1,r 0 9,r 15 1,r 10 2
+
+################################################################################
+#
+# Multi-band GC operations -- like above, but they cause GC that results in RMW
+# of multiple bands.
+#
+################################################################################
+
+# Write enough to two bands sharing the cache band to cause GC and then read the
+# whole disk.
+w b 8 1,w a 1 1,w c 6 1,w x 0 1,r xa____c_b___ 0 12:w 12 1,w 13 1,w 14 1,r 0 1,r 1 1,r 2 1,r 13 1,w 0 1,w 1 1,w 2 1,r 6 1,r 7 1,r 8 1,r 14 1,r 12 1,w 6 1,w 7 1,w 8 1,w 12 1,r 12 1,r 1 11
+w x 10 1,w ab 3 2,w z 9 1,r ___ab____zx_ 0 12:w 15 1,w 16 2,r 3 1,r 4 1,r 5 1,r 16 1,r 17 1,w 3 1,w 4 1,w 5 1,r 9 1,r 10 1,r 11 1,r 15 1,w 9 1,w 10 1,w 11 1,w 15 1,r 0 9,r 15 1,r 10 2
+
+# Write to two bands sharing the cache band, then do another band-crossing write
+# that will cause RMW of two bands and a write to another band.
+w a 4 1,w dx 9 2,w fo 5 2,r ____afo__dx_ 0 12:w 15 1,w 16 2,r 3 1,r 4 1,r 5 1,r 15 1,w 3 1,w 4 1,w 5 1,r 9 1,r 10 1,r 11 1,r 16 1,r 17 1,w 9 1,w 10 1,w 11 1,w 15 1,w 12 1,r 0 5,r 15 1,r 12 1,r 7 5

@@ -59,28 +59,12 @@
 #define lba_to_pba(lba) ((int32_t) (lba / LBAS_IN_PBA))
 #define pba_to_lba(pba) (((sector_t) pba) * LBAS_IN_PBA)
 
-static inline void DBG(struct bio *bio, int error)
-{
-        int i;
-        struct bio_vec *bv;
-        unsigned long flags;
-
-        DMERR("%s %c %d %u [%lu] vcnt: %hu idx: %hu",    \
-              (error ? "!!" : "OK"),                     \
-              (bio_data_dir(bio) == READ ? 'R' : 'W'),   \
-              lba_to_pba(bio->bi_sector),                \
-              bio->bi_size / PBA_SIZE,                   \
-              bio->bi_sector,                            \
-              bio->bi_vcnt,                              \
-              bio->bi_idx);
-
-        bio_for_each_segment(bv, bio, i) {
-                char *addr = bvec_kmap_irq(bv, &flags);
-                DMERR("segment %d: addr: %p len: %u offset: %u char [%d]",
-                      i, addr, bv->bv_len, bv->bv_offset, *addr);
-                bvec_kunmap_irq(addr, &flags);
-        }
-}
+#define DEBUG_BIO(bio)                                                  \
+        pr_debug("%10s: %c %d %u\n",                                    \
+                 __func__,                                              \
+                 (bio_data_dir(bio) == READ ? 'R' : 'W'),               \
+                 lba_to_pba(bio->bi_sector),                            \
+                 bio->bi_size / PBA_SIZE)
 
 enum state {
         STATE_START_GC,
@@ -261,7 +245,7 @@ static void endio(struct bio *clone, int error)
         if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
                 io->error = -EIO;
 
-        DBG(clone, error);
+        DEBUG_BIO(clone);
 
         bio_put(clone);
         if (atomic_dec_and_test(&io->pending)) {
@@ -315,17 +299,17 @@ static bool get_args(struct dm_target *ti, struct sadc_c *sc,
 
 static void debug_print(struct sadc_c *sc)
 {
-        DMERR("Device: %s",                  sc->dev->name);
-        DMERR("Disk size: %Lu bytes",        sc->disk_size);
-        DMERR("Band size: %Lu bytes",        sc->band_size);
-        DMERR("Band size: %d pbas",          sc->band_size_pbas);
-        DMERR("Total number of bands: %d",   sc->num_bands);
-        DMERR("Number of cache bands: %d",   sc->num_cache_bands);
-        DMERR("Cache size: %Lu bytes",       sc->cache_size);
-        DMERR("Number of data bands: %d",    sc->num_data_bands);
-        DMERR("Usable disk size: %Lu bytes", sc->usable_size);
-        DMERR("Number of usable pbas: %d",   sc->num_usable_pbas);
-        DMERR("Wasted disk size: %Lu bytes", sc->wasted_size);
+        DMINFO("Device: %s",                  sc->dev->name);
+        DMINFO("Disk size: %Lu bytes",        sc->disk_size);
+        DMINFO("Band size: %Lu bytes",        sc->band_size);
+        DMINFO("Band size: %d pbas",          sc->band_size_pbas);
+        DMINFO("Total number of bands: %d",   sc->num_bands);
+        DMINFO("Number of cache bands: %d",   sc->num_cache_bands);
+        DMINFO("Cache size: %Lu bytes",       sc->cache_size);
+        DMINFO("Number of data bands: %d",    sc->num_data_bands);
+        DMINFO("Usable disk size: %Lu bytes", sc->usable_size);
+        DMINFO("Number of usable pbas: %d",   sc->num_usable_pbas);
+        DMINFO("Wasted disk size: %Lu bytes", sc->wasted_size);
 }
 
 static void calc_params(struct sadc_c *sc)
@@ -360,10 +344,10 @@ static int reset_disk(struct sadc_c *sc)
 {
         int i;
 
-        DMERR("Resetting disk...");
+        DMINFO("Resetting disk...");
 
         if (!mutex_trylock(&sc->c_lock)) {
-                DMERR("Cannot reset -- GC in progres...");
+                DMINFO("Cannot reset -- GC in progres...");
                 return -EIO;
         }
 
@@ -416,7 +400,7 @@ static int sadc_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         struct sadc_c *sc;
         int32_t ret;
 
-        DMERR("Constructing...");
+        DMINFO("Constructing...");
 
         sc = kzalloc(sizeof(*sc), GFP_KERNEL);
         if (!sc) {
@@ -489,7 +473,7 @@ static void sadc_dtr(struct dm_target *ti)
         int i;
         struct sadc_c *sc = (struct sadc_c *) ti->private;
 
-        DMERR("Destructing...");
+        DMINFO("Destructing...");
 
         ti->private = NULL;
         if (!sc)
@@ -691,7 +675,7 @@ static void remap(struct sadc_c *sc, struct bio *bio)
                         map_lba(sc, base + i * LBAS_IN_PBA);
         }
 
-        DBG(bio, 0);
+        DEBUG_BIO(bio);
 }
 
 static void init_bio(struct io *io, struct bio *bio,
@@ -864,13 +848,12 @@ static void do_start_gc(struct sadc_c *sc)
 
         sc->state = STATE_START_CACHE_BAND_GC;
 
-        if (space_in_cache_band(sc, cb) < s) {
-                DMERR("Setting cache band %d", b % sc->num_cache_bands);
+        if (space_in_cache_band(sc, cb) < s)
                 sc->gc_cache_band = cb;
-        } else {
-                DMERR("Setting cache band %d", (b+1) % sc->num_cache_bands);
-                sc->gc_cache_band = cache_band(sc, b+1);
-        }
+        else
+                sc->gc_cache_band = cache_band(sc, ++b);
+
+        pr_debug("sc->gc_cache_band -> %d\n", b % sc->num_cache_bands);
 }
 
 static inline int band_to_bit(struct sadc_c *sc, struct cache_band *cb,
@@ -894,7 +877,7 @@ static void do_start_cache_band_gc(struct sadc_c *sc)
 
         i = find_first_bit(cb->map, sc->cache_assoc);
         sc->rmw_data_band = bit_to_band(sc, cb, i);
-        DMERR("Setting RMW band to %d", sc->rmw_data_band);
+        pr_debug("sc->rmw_data_band -> %d\n", sc->rmw_data_band);
 }
 
 static int do_read_data_band(struct sadc_c *sc)
@@ -1062,7 +1045,7 @@ static void do_fail_gc(struct sadc_c *sc, int error)
         mutex_unlock(&sc->c_lock);
 
         io->error = error;
-        DMERR("Failing GC.");
+        pr_debug("GC failed.\n");
         release_io(io);
 }
 
@@ -1075,34 +1058,34 @@ static void gc(struct sadc_c *sc, int error)
 
                 switch (state) {
                 case STATE_START_GC:
-                        DMERR("STATE_START_GC");
+                        pr_debug("STATE_START_GC\n");
                         WARN_ON(error);
                         do_start_gc(sc);
                         break;
                 case STATE_START_CACHE_BAND_GC:
-                        DMERR("STATE_START_CACHE_BAND_GC");
+                        pr_debug("STATE_START_CACHE_BAND_GC\n");
                         WARN_ON(error);
                         do_start_cache_band_gc(sc);
                         break;
                 case STATE_READ_DATA_BAND:
-                        DMERR("STATE_READ_DATA_BAND");
+                        pr_debug("STATE_READ_DATA_BAND\n");
                         WARN_ON(error);
                         error = do_read_data_band(sc);
                         break;
                 case STATE_MODIFY_DATA_BAND:
-                        DMERR("STATE_MODIFY_DATA_BAND");
+                        pr_debug("STATE_MODIFY_DATA_BAND\n");
                         error = do_modify_data_band(sc, error);
                         break;
                 case STATE_WRITE_DATA_BAND:
-                        DMERR("STATE_WRITE_DATA_BAND");
+                        pr_debug("STATE_WRITE_DATA_BAND\n");
                         error = do_write_data_band(sc, error);
                         break;
                 case STATE_RMW_COMPLETE:
-                        DMERR("STATE_RMW_COMPLETE");
+                        pr_debug("STATE_RMW_COMPLETE\n");
                         error = do_rmw_complete(sc, error);
                         break;
                 case STATE_GC_COMPLETE:
-                        DMERR("STATE_GC_COMPLETE");
+                        pr_debug("STATE_GC_COMPLETE\n");
                         WARN_ON(error);
                         do_gc_complete(sc);
                         break;
@@ -1118,8 +1101,7 @@ static void gc(struct sadc_c *sc, int error)
 
 static void start_gc(struct sadc_c *sc, struct io *io)
 {
-        DMERR("Starting gc for bio");
-        DBG(io->bio, 0);
+        DEBUG_BIO(io->bio);
 
         mutex_lock(&sc->c_lock);
 
@@ -1160,7 +1142,7 @@ static int sadc_map(struct dm_target *ti, struct bio *bio)
         struct sadc_c *sc = ti->private;
         struct io *io;
 
-        DBG(bio, -1);
+        DEBUG_BIO(bio);
 
         if (fast(sc, bio)) {
                 remap(sc, bio);

@@ -56,16 +56,6 @@
  */
 #define MAX_SEGMENTS_IN_BIO 32
 
-#define lba_to_pba(lba) ((int32_t) (lba / LBAS_IN_PBA))
-#define pba_to_lba(pba) (((sector_t) pba) * LBAS_IN_PBA)
-
-#define DEBUG_BIO(bio)                                                  \
-        pr_debug("%10s: %c %d %u\n",                                    \
-                 __func__,                                              \
-                 (bio_data_dir(bio) == READ ? 'R' : 'W'),               \
-                 lba_to_pba(bio->bi_sector),                            \
-                 bio->bi_size / PBA_SIZE)
-
 enum state {
         STATE_START_GC,
         STATE_START_CACHE_BAND_GC,
@@ -106,7 +96,7 @@ struct sadc_c {
         int32_t num_valid_pbas;
 
         /* Number of usable pbas.  Excludes the cache region. */
-        int32_t num_usable_pbas;
+        int32_t num_data_pbas;
 
         /* Maps a pba to its location in the cache region.  Contains -1 for
          * unmapped pbas. */
@@ -235,6 +225,65 @@ static void release_io(struct io *io)
                 bio_endio(bio, error);
 }
 
+static inline bool data_pba(struct sadc_c *sc, int32_t pba)
+{
+        return 0 <= pba && pba < sc->num_data_pbas;
+}
+
+static inline bool cache_pba(struct sadc_c *sc, int32_t pba)
+{
+        return sc->num_data_pbas <= pba && pba < sc->num_valid_pbas;
+}
+
+static inline int32_t lba_to_pba(struct sadc_c *sc, sector_t lba)
+{
+        int32_t pba = (int32_t) (lba / LBAS_IN_PBA);
+
+        WARN_ON(!data_pba(sc, pba));
+
+        return pba;
+}
+
+static inline sector_t pba_to_lba(struct sadc_c *sc, int32_t pba)
+{
+        sector_t lba = (sector_t) pba * LBAS_IN_PBA;
+
+        WARN_ON(!data_pba(sc, pba) && !cache_pba(sc, pba));
+
+        return lba;
+}
+
+static inline void debug_bio(struct sadc_c *sc, struct bio *bio)
+{
+        pr_debug("%10s: %c %d %u\n",
+                 __func__,
+                 (bio_data_dir(bio) == READ ? 'R' : 'W'),
+                 lba_to_pba(sc, bio->bi_sector),
+                 bio->bi_size / PBA_SIZE);
+}
+
+/* Returns the band on which |lba| resides. */
+static int32_t band(struct sadc_c *sc, sector_t lba)
+{
+        return lba_to_pba(sc, lba) / sc->band_size_pbas;
+}
+
+/* Returns the cache band for the |band|. */
+static struct cache_band *cache_band(struct sadc_c *sc, int32_t band)
+{
+        int i = band % sc->num_cache_bands;
+
+        WARN_ON(!(0 <= i && i < sc->num_cache_bands));
+
+        return &sc->cache_bands[i];
+}
+
+/* Returns available space in pbas in cache band |cb|.  */
+static int32_t space_in_cache_band(struct sadc_c *sc, struct cache_band *cb)
+{
+        return sc->band_size_pbas - (cb->current_pba - cb->begin_pba);
+}
+
 static void gc(struct sadc_c *sc, int error);
 
 static void endio(struct bio *clone, int error)
@@ -245,7 +294,7 @@ static void endio(struct bio *clone, int error)
         if (unlikely(!bio_flagged(clone, BIO_UPTODATE) && !error))
                 io->error = -EIO;
 
-        DEBUG_BIO(clone);
+        debug_bio(sc, clone);
 
         bio_put(clone);
         if (atomic_dec_and_test(&io->pending)) {
@@ -254,84 +303,6 @@ static void endio(struct bio *clone, int error)
                 if (gc_io)
                         gc(sc, error);
         }
-}
-
-static bool get_args(struct dm_target *ti, struct sadc_c *sc,
-                     int argc, char **argv)
-{
-        unsigned long long tmp;
-        char dummy;
-
-        if (argc != 5) {
-                ti->error = "dm-sadc: Invalid argument count.";
-                return false;
-        }
-
-        /* TODO: Change bounds back after testing. */
-        if (sscanf(argv[1], "%llu%c", &tmp, &dummy) != 1 || tmp & 0xfff ||
-            (tmp < /* 512 */ 4 * 1024 || tmp > 2 * 1024 * 1024)) {
-                ti->error = "dm-sadc: Invalid track size.";
-                return false;
-        }
-        sc->track_size = tmp;
-
-        if (sscanf(argv[2], "%llu%c", &tmp, &dummy) != 1 || tmp < 1 /* 20 */ || tmp > 200) {
-                ti->error = "dm-sadc: Invalid band size.";
-                return false;
-        }
-        sc->band_size_tracks = tmp;
-
-        if (sscanf(argv[3], "%llu%c", &tmp, &dummy) != 1 || tmp < 1 || tmp > 50 /* 20 */) {
-                ti->error = "dm-sadc: Invalid cache percent.";
-                return false;
-        }
-        sc->cache_percent = tmp;
-
-        if (sscanf(argv[4], "%llu%c", &tmp, &dummy) != 1 ||
-            tmp < MIN_DISK_SIZE || tmp > MAX_DISK_SIZE) {
-                ti->error = "dm-sadc: Invalid disk size.";
-                return false;
-        }
-        sc->disk_size = tmp;
-
-        return true;
-}
-
-static void debug_print(struct sadc_c *sc)
-{
-        DMINFO("Device: %s",                  sc->dev->name);
-        DMINFO("Disk size: %Lu bytes",        sc->disk_size);
-        DMINFO("Band size: %Lu bytes",        sc->band_size);
-        DMINFO("Band size: %d pbas",          sc->band_size_pbas);
-        DMINFO("Total number of bands: %d",   sc->num_bands);
-        DMINFO("Number of cache bands: %d",   sc->num_cache_bands);
-        DMINFO("Cache size: %Lu bytes",       sc->cache_size);
-        DMINFO("Number of data bands: %d",    sc->num_data_bands);
-        DMINFO("Usable disk size: %Lu bytes", sc->usable_size);
-        DMINFO("Number of usable pbas: %d",   sc->num_usable_pbas);
-        DMINFO("Wasted disk size: %Lu bytes", sc->wasted_size);
-}
-
-static void calc_params(struct sadc_c *sc)
-{
-        sc->band_size       = sc->band_size_tracks * sc->track_size;
-        sc->band_size_pbas  = sc->band_size / PBA_SIZE;
-        sc->num_bands       = sc->disk_size / sc->band_size;
-        sc->num_cache_bands = sc->num_bands * sc->cache_percent / 100;
-        sc->cache_size      = sc->num_cache_bands * sc->band_size;
-
-        /* Make |num_data_bands| a multiple of |num_cache_bands| so that all
-         * cache bands are equally loaded. */
-        sc->num_data_bands = (sc->num_bands / sc->num_cache_bands - 1) *
-                sc->num_cache_bands;
-
-        sc->cache_assoc     = sc->num_data_bands / sc->num_cache_bands;
-        sc->usable_size     = sc->num_data_bands * sc->band_size;
-        sc->wasted_size     = sc->disk_size - sc->cache_size - sc->usable_size;
-        sc->num_valid_pbas  = (sc->usable_size + sc->cache_size) / PBA_SIZE;
-        sc->num_usable_pbas = sc->usable_size / PBA_SIZE;
-
-        WARN_ON(sc->usable_size % PBA_SIZE);
 }
 
 static void reset_cache_band(struct sadc_c *sc, struct cache_band *cb)
@@ -353,188 +324,23 @@ static int reset_disk(struct sadc_c *sc)
 
         for (i = 0; i < sc->num_cache_bands; ++i)
                 reset_cache_band(sc, &sc->cache_bands[i]);
-        memset(sc->pba_map, -1, sizeof(int32_t) * sc->num_usable_pbas);
+        memset(sc->pba_map, -1, sizeof(int32_t) * sc->num_data_pbas);
 
         mutex_unlock(&sc->c_lock);
 
         return 0;
 }
-
-static bool alloc_structs(struct sadc_c *sc)
-{
-        int32_t i, size, pba;
-
-        size = sizeof(int32_t) * sc->num_usable_pbas;
-        sc->pba_map = vmalloc(size);
-        if (!sc->pba_map)
-                return false;
-        memset(sc->pba_map, -1, size);
-        sc->rmw_data_band = -1;
-
-        size = sizeof(struct cache_band) * sc->num_cache_bands;
-        sc->cache_bands = vmalloc(size);
-        if (!sc->cache_bands)
-                return false;
-
-        /* The cache region starts where the data region ends. */
-        pba = sc->num_usable_pbas;
-        size = BITS_TO_LONGS(sc->cache_assoc) * sizeof(long);
-        for (i = 0; i < sc->num_cache_bands; ++i) {
-                unsigned long *bitmap = kmalloc(size, GFP_KERNEL);
-                if (!bitmap)
-                        return false;
-                sc->cache_bands[i].map = bitmap;
-
-                sc->cache_bands[i].begin_pba = pba;
-                sc->cache_bands[i].begin_data_band = i;
-                reset_cache_band(sc, &sc->cache_bands[i]);
-                pba += sc->band_size_pbas;
-        }
-        return true;
-}
-
-static void sadc_dtr(struct dm_target *ti);
-
-static int sadc_ctr(struct dm_target *ti, unsigned int argc, char **argv)
-{
-        struct sadc_c *sc;
-        int32_t ret;
-
-        DMINFO("Constructing...");
-
-        sc = kzalloc(sizeof(*sc), GFP_KERNEL);
-        if (!sc) {
-                ti->error = "dm-sadc: Cannot allocate sadc context.";
-                return -ENOMEM;
-        }
-        ti->private = sc;
-
-        if (!get_args(ti, sc, argc, argv)) {
-                kzfree(sc);
-                return -EINVAL;
-        }
-
-        calc_params(sc);
-
-        ret = -ENOMEM;
-        if (!alloc_structs(sc)) {
-                ti->error = "Cannot allocate data structures.";
-                goto bad;
-        }
-
-        sc->io_pool = mempool_create_slab_pool(MIN_IOS, _io_pool);
-        if (!sc->io_pool) {
-                ti->error = "Cannot allocate mempool.";
-                goto bad;
-        }
-
-        sc->page_pool = mempool_create_page_pool(MIN_POOL_PAGES, 0);
-        if (!sc->page_pool) {
-                ti->error = "Cannot allocate page mempool";
-                goto bad;
-        }
-
-        sc->bs = bioset_create(MIN_IOS, 0);
-        if (!sc->bs) {
-                ti->error = "Cannot allocate bioset.";
-                goto bad;
-        }
-
-        sc->queue = alloc_workqueue("sadcd",
-                                    WQ_NON_REENTRANT | WQ_MEM_RECLAIM, 1);
-        if (!sc->queue) {
-                ti->error = "Cannot allocate work queue.";
-                goto bad;
-        }
-
-        ret = -EINVAL;
-        if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &sc->dev)) {
-                ti->error = "dm-sadc: Device lookup failed.";
-                return -1;
-        }
-
-        mutex_init(&sc->c_lock);
-
-        debug_print(sc);
-
-        /* TODO: Reconsider proper values for these. */
-        ti->num_flush_bios = 1;
-        ti->num_discard_bios = 1;
-        ti->num_write_same_bios = 1;
-        return 0;
-
-bad:
-        sadc_dtr(ti);
-        return ret;
-}
-
-static void sadc_dtr(struct dm_target *ti)
-{
-        int i;
-        struct sadc_c *sc = (struct sadc_c *) ti->private;
-
-        DMINFO("Destructing...");
-
-        ti->private = NULL;
-        if (!sc)
-                return;
-
-        if (sc->queue)
-                destroy_workqueue(sc->queue);
-        if (sc->page_pool)
-                mempool_destroy(sc->page_pool);
-        if (sc->io_pool)
-                mempool_destroy(sc->io_pool);
-        if (sc->dev)
-                dm_put_device(ti, sc->dev);
-
-        for (i = 0; i < sc->num_cache_bands; ++i)
-                if (sc->cache_bands[i].map)
-                        kfree(sc->cache_bands[i].map);
-
-        if (sc->pba_map)
-                vfree(sc->pba_map);
-        if (sc->cache_bands)
-                vfree(sc->cache_bands);
-        kzfree(sc);
-}
-
-/* Returns the band on which |lba| resides. */
-static int32_t band(struct sadc_c *sc, sector_t lba)
-{
-        return lba_to_pba(lba) / sc->band_size_pbas;
-}
-
-/* Returns the cache band for the |band|. */
-static struct cache_band *cache_band(struct sadc_c *sc, int32_t band)
-{
-        int i = band % sc->num_cache_bands;
-
-        WARN_ON(!(0 <= i && i < sc->num_cache_bands));
-
-        return &sc->cache_bands[i];
-}
-
-/* Returns available space in pbas in cache band |cb|.  */
-static int32_t space_in_cache_band(struct sadc_c *sc, struct cache_band *cb)
-{
-        return sc->band_size_pbas - (cb->current_pba - cb->begin_pba);
-}
-
 /* Returns PBA to which |lba| was mapped. */
 static sector_t lookup_lba(struct sadc_c *sc, sector_t lba)
 {
-        int32_t mpba, pba = lba_to_pba(lba);
+        int32_t pba = sc->pba_map[lba_to_pba(sc, lba)];
 
-        WARN_ON(!(0 <= pba && pba < sc->num_usable_pbas));
-
-        mpba = sc->pba_map[pba];
-        if (mpba == -1)
+        if (pba == -1)
                 return lba;
 
-        WARN_ON(!(sc->num_usable_pbas <= mpba && mpba < sc->num_valid_pbas));
+        WARN_ON(!cache_pba(sc, pba));
 
-        return pba_to_lba(mpba) + lba % LBAS_IN_PBA;
+        return pba_to_lba(sc, pba) + lba % LBAS_IN_PBA;
 }
 
 /*
@@ -543,12 +349,12 @@ static sector_t lookup_lba(struct sadc_c *sc, sector_t lba)
  */
 static sector_t map_lba(struct sadc_c *sc, sector_t lba)
 {
-        int32_t mpba, pba = lba_to_pba(lba), b = band(sc, lba);
+        int32_t mpba, pba = lba_to_pba(sc, lba), b = band(sc, lba);
         struct cache_band *cb = cache_band(sc, b);
         int i = (b - cb->begin_data_band) / sc->num_cache_bands;
 
         WARN_ON(!space_in_cache_band(sc, cb));
-        WARN_ON(!(0 <= pba && pba < sc->num_usable_pbas));
+
         WARN_ON(!(0 <= b && b < sc->num_data_bands));
         WARN_ON(!(0 <= i && i < sc->cache_assoc));
 
@@ -557,9 +363,9 @@ static sector_t map_lba(struct sadc_c *sc, sector_t lba)
         set_bit(i, cb->map);
         mpba = sc->pba_map[pba];
 
-        WARN_ON(!(sc->num_usable_pbas <= mpba && mpba < sc->num_valid_pbas));
+        WARN_ON(!cache_pba(sc, mpba));
 
-        return pba_to_lba(mpba);
+        return pba_to_lba(sc, mpba);
 }
 
 static void clear_pba_map_for_rmw_band(struct sadc_c *sc)
@@ -595,8 +401,8 @@ static int32_t size_in_band(struct sadc_c *sc, struct bio *bio, int32_t band)
         int32_t bb = band * sc->band_size_pbas;
         int32_t be = bb + sc->band_size_pbas;
 
-        int32_t b = max(bb, lba_to_pba(bio->bi_sector));
-        int32_t e = min(be, lba_to_pba(bio_end_sector(bio)));
+        int32_t b = max(bb, lba_to_pba(sc, bio->bi_sector));
+        int32_t e = min(be, lba_to_pba(sc, bio_end_sector(bio)));
 
         return e > b ? e - b : 0;
 }
@@ -610,7 +416,7 @@ static bool does_not_cross_bands(struct sadc_c *sc, struct bio *bio)
 {
         int32_t nb = band(sc, bio->bi_sector) + 1;
 
-        return bio_end_sector(bio) <= pba_to_lba(nb * sc->band_size_pbas);
+        return bio_end_sector(bio) <= pba_to_lba(sc, nb * sc->band_size_pbas);
 }
 
 /* Returns whether |bio| is 4 KB aligned.  */
@@ -675,11 +481,11 @@ static void remap(struct sadc_c *sc, struct bio *bio)
                         map_lba(sc, base + i * LBAS_IN_PBA);
         }
 
-        DEBUG_BIO(bio);
+        debug_bio(sc, bio);
 }
 
 static void init_bio(struct io *io, struct bio *bio,
-                     sector_t sector, int idx, int vcnt)
+                     sector_t sector, int idx, int pba_cnt)
 {
         struct sadc_c *sc = io->sc;
 
@@ -687,12 +493,12 @@ static void init_bio(struct io *io, struct bio *bio,
         bio->bi_end_io = endio;
         bio->bi_idx = idx;
         bio->bi_sector = sector;
-        bio->bi_size = vcnt * PAGE_SIZE;
+        bio->bi_size = pba_cnt * PBA_SIZE;
         bio->bi_bdev = sc->dev->bdev;
 }
 
 static struct bio *clone_bio(struct io *io, struct bio *bio,
-                             sector_t sector, int idx, int vcnt)
+                             sector_t sector, int idx, int pba_cnt)
 {
         struct sadc_c *sc = io->sc;
         struct bio *clone;
@@ -701,19 +507,19 @@ static struct bio *clone_bio(struct io *io, struct bio *bio,
         if (!clone)
                 return NULL;
 
-        init_bio(io, clone, sector, idx, vcnt);
+        init_bio(io, clone, sector, idx, pba_cnt);
         atomic_inc(&io->pending);
 
         return clone;
 }
 
-static struct bio *alloc_bio(struct io *io, sector_t sector, int vcnt)
+static struct bio *alloc_bio(struct io *io, sector_t sector, int pba_cnt)
 {
         struct sadc_c *sc = io->sc;
         struct bio *bio;
         struct page *page;
 
-        bio = bio_alloc_bioset(GFP_NOIO, vcnt, sc->bs);
+        bio = bio_alloc_bioset(GFP_NOIO, pba_cnt, sc->bs);
         if (!bio)
                 return NULL;
 
@@ -750,21 +556,21 @@ static int split_write_bio(struct sadc_c *sc, struct io *io, struct bio **bios)
 {
         struct bio *bio = io->bio;
         int32_t b = band(sc, bio->bi_sector);
-        int vcnt = size_in_band(sc, bio, b);
+        int pba_cnt = size_in_band(sc, bio, b);
         sector_t sector = map_lba(sc, bio->bi_sector);
         int idx = 0;
 
-        bios[0] = clone_bio(io, bio, sector, idx, vcnt);
+        bios[0] = clone_bio(io, bio, sector, idx, pba_cnt);
         if (!bios[0])
                 return io->error = -ENOMEM;
 
-        vcnt = bio_pbas(bio) - vcnt;
-        if (!vcnt)
+        pba_cnt = bio_pbas(bio) - pba_cnt;
+        if (!pba_cnt)
                 return 1;
 
-        sector = map_lba(sc, bio->bi_sector + pba_to_lba(vcnt));
-        idx += vcnt;
-        bios[1] = clone_bio(io, bio, sector, idx, vcnt);
+        sector = map_lba(sc, bio->bi_sector + pba_cnt * LBAS_IN_PBA);
+        idx += pba_cnt;
+        bios[1] = clone_bio(io, bio, sector, idx, pba_cnt);
         if (!bios[1]) {
                 release_bio(bios[0]);
                 return io->error = -ENOMEM;
@@ -894,7 +700,7 @@ static int do_read_data_band(struct sadc_c *sc)
         if (!io)
                 return -ENOMEM;
         for (i = 0; i < sc->band_size_pbas; ++i) {
-                nbios[i] = alloc_bio(io, pba_to_lba(pba + i), 1);
+                nbios[i] = alloc_bio(io, pba_to_lba(sc, pba + i), 1);
                 if (!nbios[i])
                         goto bad;
         }
@@ -939,7 +745,7 @@ static int do_modify_data_band(struct sadc_c *sc, int error)
 
         for (i = j = 0; i < sc->band_size_pbas; ++i) {
                 sector_t sector = lookup_lba(sc, sc->bios[i]->bi_sector);
-                if (sector == pba_to_lba(pba + i))
+                if (sector == pba_to_lba(sc, pba + i))
                         continue;
                 nbios[j] = clone_bio(io, sc->bios[i], sector, 0, 1);
                 if (!nbios[j])
@@ -1101,7 +907,7 @@ static void gc(struct sadc_c *sc, int error)
 
 static void start_gc(struct sadc_c *sc, struct io *io)
 {
-        DEBUG_BIO(io->bio);
+        debug_bio(sc, io->bio);
 
         mutex_lock(&sc->c_lock);
 
@@ -1137,12 +943,228 @@ static void queue_io(struct io *io)
         queue_work(sc->queue, &io->work);
 }
 
+static bool alloc_structs(struct sadc_c *sc)
+{
+        int32_t i, size, pba;
+
+        size = sizeof(int32_t) * sc->num_data_pbas;
+        sc->pba_map = vmalloc(size);
+        if (!sc->pba_map)
+                return false;
+        memset(sc->pba_map, -1, size);
+        sc->rmw_data_band = -1;
+
+        size = sizeof(struct cache_band) * sc->num_cache_bands;
+        sc->cache_bands = vmalloc(size);
+        if (!sc->cache_bands)
+                return false;
+
+        /* The cache region starts where the data region ends. */
+        pba = sc->num_data_pbas;
+        size = BITS_TO_LONGS(sc->cache_assoc) * sizeof(long);
+        for (i = 0; i < sc->num_cache_bands; ++i) {
+                unsigned long *bitmap = kmalloc(size, GFP_KERNEL);
+                if (!bitmap)
+                        return false;
+                sc->cache_bands[i].map = bitmap;
+
+                sc->cache_bands[i].begin_pba = pba;
+                sc->cache_bands[i].begin_data_band = i;
+                reset_cache_band(sc, &sc->cache_bands[i]);
+                pba += sc->band_size_pbas;
+        }
+        return true;
+}
+
+static bool get_args(struct dm_target *ti, struct sadc_c *sc,
+                     int argc, char **argv)
+{
+        unsigned long long tmp;
+        char dummy;
+
+        if (argc != 5) {
+                ti->error = "dm-sadc: Invalid argument count.";
+                return false;
+        }
+
+        /* TODO: Change bounds back after testing. */
+        if (sscanf(argv[1], "%llu%c", &tmp, &dummy) != 1 || tmp & 0xfff ||
+            (tmp < /* 512 */ 4 * 1024 || tmp > 2 * 1024 * 1024)) {
+                ti->error = "dm-sadc: Invalid track size.";
+                return false;
+        }
+        sc->track_size = tmp;
+
+        if (sscanf(argv[2], "%llu%c", &tmp, &dummy) != 1 || tmp < 1 /* 20 */ || tmp > 200) {
+                ti->error = "dm-sadc: Invalid band size.";
+                return false;
+        }
+        sc->band_size_tracks = tmp;
+
+        if (sscanf(argv[3], "%llu%c", &tmp, &dummy) != 1 || tmp < 1 || tmp > 50 /* 20 */) {
+                ti->error = "dm-sadc: Invalid cache percent.";
+                return false;
+        }
+        sc->cache_percent = tmp;
+
+        if (sscanf(argv[4], "%llu%c", &tmp, &dummy) != 1 ||
+            tmp < MIN_DISK_SIZE || tmp > MAX_DISK_SIZE) {
+                ti->error = "dm-sadc: Invalid disk size.";
+                return false;
+        }
+        sc->disk_size = tmp;
+
+        return true;
+}
+
+static void calc_params(struct sadc_c *sc)
+{
+        sc->band_size       = sc->band_size_tracks * sc->track_size;
+        sc->band_size_pbas  = sc->band_size / PBA_SIZE;
+        sc->num_bands       = sc->disk_size / sc->band_size;
+        sc->num_cache_bands = sc->num_bands * sc->cache_percent / 100;
+        sc->cache_size      = sc->num_cache_bands * sc->band_size;
+
+        /* Make |num_data_bands| a multiple of |num_cache_bands| so that all
+         * cache bands are equally loaded. */
+        sc->num_data_bands = (sc->num_bands / sc->num_cache_bands - 1) *
+                sc->num_cache_bands;
+
+        sc->cache_assoc     = sc->num_data_bands / sc->num_cache_bands;
+        sc->usable_size     = sc->num_data_bands * sc->band_size;
+        sc->wasted_size     = sc->disk_size - sc->cache_size - sc->usable_size;
+        sc->num_valid_pbas  = (sc->usable_size + sc->cache_size) / PBA_SIZE;
+        sc->num_data_pbas = sc->usable_size / PBA_SIZE;
+
+        WARN_ON(sc->usable_size % PBA_SIZE);
+}
+
+static void print_params(struct sadc_c *sc)
+{
+        DMINFO("Device: %s",                  sc->dev->name);
+        DMINFO("Disk size: %Lu bytes",        sc->disk_size);
+        DMINFO("Band size: %Lu bytes",        sc->band_size);
+        DMINFO("Band size: %d pbas",          sc->band_size_pbas);
+        DMINFO("Total number of bands: %d",   sc->num_bands);
+        DMINFO("Number of cache bands: %d",   sc->num_cache_bands);
+        DMINFO("Cache size: %Lu bytes",       sc->cache_size);
+        DMINFO("Number of data bands: %d",    sc->num_data_bands);
+        DMINFO("Usable disk size: %Lu bytes", sc->usable_size);
+        DMINFO("Number of usable pbas: %d",   sc->num_data_pbas);
+        DMINFO("Wasted disk size: %Lu bytes", sc->wasted_size);
+}
+
+static void sadc_dtr(struct dm_target *ti);
+
+static int sadc_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+{
+        struct sadc_c *sc;
+        int32_t ret;
+
+        DMINFO("Constructing...");
+
+        sc = kzalloc(sizeof(*sc), GFP_KERNEL);
+        if (!sc) {
+                ti->error = "dm-sadc: Cannot allocate sadc context.";
+                return -ENOMEM;
+        }
+        ti->private = sc;
+
+        if (!get_args(ti, sc, argc, argv)) {
+                kzfree(sc);
+                return -EINVAL;
+        }
+
+        calc_params(sc);
+        print_params(sc);
+
+        ret = -ENOMEM;
+        if (!alloc_structs(sc)) {
+                ti->error = "Cannot allocate data structures.";
+                goto bad;
+        }
+
+        sc->io_pool = mempool_create_slab_pool(MIN_IOS, _io_pool);
+        if (!sc->io_pool) {
+                ti->error = "Cannot allocate mempool.";
+                goto bad;
+        }
+
+        sc->page_pool = mempool_create_page_pool(MIN_POOL_PAGES, 0);
+        if (!sc->page_pool) {
+                ti->error = "Cannot allocate page mempool";
+                goto bad;
+        }
+
+        sc->bs = bioset_create(MIN_IOS, 0);
+        if (!sc->bs) {
+                ti->error = "Cannot allocate bioset.";
+                goto bad;
+        }
+
+        sc->queue = alloc_workqueue("sadcd",
+                                    WQ_NON_REENTRANT | WQ_MEM_RECLAIM, 1);
+        if (!sc->queue) {
+                ti->error = "Cannot allocate work queue.";
+                goto bad;
+        }
+
+        ret = -EINVAL;
+        if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &sc->dev)) {
+                ti->error = "dm-sadc: Device lookup failed.";
+                return -1;
+        }
+
+        mutex_init(&sc->c_lock);
+
+        /* TODO: Reconsider proper values for these. */
+        ti->num_flush_bios = 1;
+        ti->num_discard_bios = 1;
+        ti->num_write_same_bios = 1;
+        return 0;
+
+bad:
+        sadc_dtr(ti);
+        return ret;
+}
+
+static void sadc_dtr(struct dm_target *ti)
+{
+        int i;
+        struct sadc_c *sc = (struct sadc_c *) ti->private;
+
+        DMINFO("Destructing...");
+
+        ti->private = NULL;
+        if (!sc)
+                return;
+
+        if (sc->queue)
+                destroy_workqueue(sc->queue);
+        if (sc->page_pool)
+                mempool_destroy(sc->page_pool);
+        if (sc->io_pool)
+                mempool_destroy(sc->io_pool);
+        if (sc->dev)
+                dm_put_device(ti, sc->dev);
+
+        for (i = 0; i < sc->num_cache_bands; ++i)
+                if (sc->cache_bands[i].map)
+                        kfree(sc->cache_bands[i].map);
+
+        if (sc->pba_map)
+                vfree(sc->pba_map);
+        if (sc->cache_bands)
+                vfree(sc->cache_bands);
+        kzfree(sc);
+}
+
 static int sadc_map(struct dm_target *ti, struct bio *bio)
 {
         struct sadc_c *sc = ti->private;
         struct io *io;
 
-        DEBUG_BIO(bio);
+        debug_bio(sc, bio);
 
         if (fast(sc, bio)) {
                 remap(sc, bio);

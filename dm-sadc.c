@@ -668,6 +668,8 @@ static void do_start_gc(struct sadc_c *sc)
 
         WARN_ON(does_not_require_gc(sc, bio));
 
+        DMINFO("Starting GC...");
+
         sc->state = STATE_START_CACHE_BAND_GC;
 
         if (free_pbas_in_cache_band(sc, cb) < nr_pbas)
@@ -873,6 +875,8 @@ static void do_gc_complete(struct sadc_c *sc)
                 sc->pending_io = NULL;
 
                 mutex_unlock(&sc->c_lock);
+
+                DMINFO("GC completed.");
         } else {
                 sc->state = STATE_START_GC;
         }

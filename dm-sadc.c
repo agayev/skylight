@@ -145,7 +145,7 @@ struct sadc_c {
 struct cache_band {
         pba_t begin_pba;    /* Where the cache band begins. */
         pba_t current_pba;  /* Where the next write will go. */
-        int32_t nr;           /* Cache band number. */
+        int32_t nr;         /* Cache band number. */
 
         /*
          * For every data band that has a block on this cache band, the bit in
@@ -224,9 +224,9 @@ static inline bool cache_pba(struct sadc_c *sc, pba_t pba)
 #define lba_to_pba(lba) ((pba_t) (lba / LBAS_IN_PBA))
 #define pba_to_lba(pba) (((lba_t) pba) * LBAS_IN_PBA)
 
-static inline bool valid_band(struct sadc_c *sc, int32_t band)
+static inline bool data_band(struct sadc_c *sc, int32_t band)
 {
-        return 0 <= band && band <= sc->nr_data_bands;
+        return 0 <= band && band < sc->nr_data_bands;
 }
 
 /*
@@ -243,7 +243,7 @@ static inline bool valid_band(struct sadc_c *sc, int32_t band)
 
 static inline pba_t band_begin_pba(struct sadc_c *sc, int32_t band)
 {
-        WARN_ON(!valid_band(sc, band));
+        WARN_ON(!data_band(sc, band));
 
         return band * sc->band_size_pbas;
 }
@@ -263,25 +263,29 @@ static inline void debug_bio(struct sadc_c *sc, struct bio *bio, const char *f)
 }
 
 /* Returns the band on which |pba| resides. */
-static int32_t band(struct sadc_c *sc, pba_t pba)
+static inline int32_t band(struct sadc_c *sc, pba_t pba)
 {
-        /* TODO: add check */
+        WARN_ON(!data_pba(sc, pba));
+
         return pba / sc->band_size_pbas;
 }
 
-static int32_t bio_band(struct sadc_c *sc, struct bio *bio)
+static inline int32_t bio_band(struct sadc_c *sc, struct bio *bio)
 {
         return band(sc, bio_begin_pba(bio));
 }
 
 /* Returns the cache band for the |band|. */
-static struct cache_band *cache_band(struct sadc_c *sc, int32_t band)
+static inline struct cache_band *cache_band(struct sadc_c *sc, int32_t band)
 {
+        WARN_ON(!data_band(sc, band));
+
         return &sc->cache_bands[band % sc->nr_cache_bands];
 }
 
 /* Returns available space in pbas in cache band |cb|.  */
-static int32_t free_pbas_in_cache_band(struct sadc_c *sc, struct cache_band *cb)
+static inline int32_t free_pbas_in_cache_band(struct sadc_c *sc,
+                                              struct cache_band *cb)
 {
         return sc->band_size_pbas - (cb->current_pba - cb->begin_pba);
 }
@@ -426,7 +430,11 @@ static int32_t pbas_in_band(struct sadc_c *sc, struct bio *bio, int32_t band)
  */
 static bool does_not_cross_bands(struct sadc_c *sc, struct bio *bio)
 {
-        return bio_end_pba(bio) <= band_begin_pba(sc, bio_band(sc, bio)+1);
+        int32_t b = bio_band(sc, bio) + 1;
+
+        if (b >= sc->nr_data_bands)
+                return true;
+        return bio_end_pba(bio) <= band_begin_pba(sc, b);
 }
 
 /* Returns whether |bio| is 4 KB aligned.  */

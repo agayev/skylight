@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -16,7 +17,7 @@ import (
 )
 
 const (
-	retryCount = 3
+	retryCount = 4
 
 	resetDisk      = 0xDEADBEEF
 	diskSize       = 76 << 10
@@ -109,7 +110,7 @@ func setup() {
 	runCmd("make clean")
 	runCmd("make")
 	runCmd("sudo insmod " + modulePath)
-	runCmd("fallocate -l " + strconv.Itoa(2 * fileSize) + " " + fileName)
+	runCmd("fallocate -l " + strconv.Itoa(2*fileSize) + " " + fileName)
 	runCmd("sudo losetup " + loopDevice + " " + fileName)
 
 	c := fmt.Sprintf("echo 0 %d %s %s %d %d %d %d | sudo dmsetup create %s",
@@ -198,9 +199,9 @@ func doResetDisk() {
 	defer f.Close()
 
 	b := alignedBlocks(1, "\x00")
-	for i := 0; i < diskSize / blockSize; i++ {
+	for i := 0; i < diskSize/blockSize; i++ {
 		if _, err := f.Write(b); err != nil {
-			panicf("Failed to write to %s: %v", fileName,err)
+			panicf("Failed to write to %s: %v", fileName, err)
 		}
 	}
 }
@@ -306,6 +307,10 @@ func eventsMatch(expectedEvents, readEvents []string) bool {
 	if len(expectedEvents) != len(readEvents) {
 		return false
 	}
+
+	sort.Strings(expectedEvents)
+	sort.Strings(readEvents)
+
 	for i := range expectedEvents {
 		if expectedEvents[i] != readEvents[i] {
 			return false

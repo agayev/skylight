@@ -3,6 +3,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/bio.h>
+#include <linux/string_helpers.h>
 
 /*
  * SADC (set-associative disk cache) STL.
@@ -176,6 +177,15 @@ struct io {
 #define MIN_POOL_PAGES 32
 
 static struct kmem_cache *_io_pool;
+
+static char *readable(u64 size)
+{
+        static char buf[10];
+
+        string_get_size(size, STRING_UNITS_2, buf, sizeof(buf));
+
+        return buf;
+}
 
 static struct io *alloc_io(struct sadc_c *sc, struct bio *bio)
 {
@@ -488,7 +498,7 @@ static void remap(struct sadc_c *sc, struct bio *bio)
 }
 
 static void init_bio(struct io *io, struct bio *bio,
-                     lba_t lba, int idx, int pba_cnt)
+                     lba_t lba, int idx, int nr_pbas)
 {
         struct sadc_c *sc = io->sc;
 
@@ -496,7 +506,7 @@ static void init_bio(struct io *io, struct bio *bio,
         bio->bi_end_io = endio;
         bio->bi_idx = idx;
         bio->bi_sector = lba;
-        bio->bi_size = pba_cnt * PBA_SIZE;
+        bio->bi_size = nr_pbas * PBA_SIZE;
         bio->bi_bdev = sc->dev->bdev;
 }
 
@@ -1088,16 +1098,18 @@ static void calc_params(struct sadc_c *sc)
 
 static void print_params(struct sadc_c *sc)
 {
-        DMINFO("Disk size: %Lu bytes",        sc->disk_size);
-        DMINFO("Band size: %Lu bytes",        sc->band_size);
-        DMINFO("Band size: %d pbas",          sc->band_size_pbas);
+
+
+        DMINFO("Disk size: %s",      readable(sc->disk_size));
+        DMINFO("Band size: %s",      readable(sc->band_size));
+        DMINFO("Band size: %d pbas", sc->band_size_pbas);
         DMINFO("Total number of bands: %d",   sc->nr_bands);
         DMINFO("Number of cache bands: %d",   sc->nr_cache_bands);
-        DMINFO("Cache size: %Lu bytes",       sc->cache_size);
+        DMINFO("Cache size: %s", readable(sc->cache_size));
         DMINFO("Number of data bands: %d",    sc->nr_data_bands);
-        DMINFO("Usable disk size: %Lu bytes", sc->usable_size);
+        DMINFO("Usable disk size: %s", readable(sc->usable_size));
         DMINFO("Number of usable pbas: %d",   sc->nr_data_pbas);
-        DMINFO("Wasted disk size: %Lu bytes", sc->wasted_size);
+        DMINFO("Wasted disk size: %s", readable(sc->wasted_size));
 }
 
 static void sadc_dtr(struct dm_target *ti);

@@ -3,6 +3,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/bio.h>
+#include <linux/completion.h>
 #include <linux/string_helpers.h>
 
 /*
@@ -23,6 +24,7 @@
 /*
  * Important TODOs.
  *
+ * TODO: Test error checking: try failing state machine functions one by one.
  * TODO: Reconsider clone_bio -- is it necessary?
  * TODO: Consider turning some WARN_ONs to debug mode only.
  * TODO: Reconsider lba/pba boundaries.
@@ -68,10 +70,16 @@ struct sadc_c {
         int64_t disk_size;
 
         /*
-         * Control access to context.  Currently, this is only used when we want
-         * to reset the disk while GC is happening.
+         * Control access to target context.  Currently, this is only used when
+         * we want to reset the disk while GC is happening.
          */
         struct mutex c_lock;
+
+        /*
+         * For signalling the working thread when one of the stages of an RMW
+         * operation is complete.
+         */
+        struct completion rmw_stage_comp;
 
         /* Percentage of space used for cache region. */
         int32_t cache_percent;
@@ -117,8 +125,13 @@ struct sadc_c {
          * be performed by worker threads. */
         struct workqueue_struct *queue;
 
-        /* GC related stuff follow. */
+        /* GC related stuff follows. */
+
+        /* Current state of the GC state machine. */
         enum state state;
+
+        /* Error generated during the execution of the last state. */
+        int error;
 
         /* io that is currently pending due to GC. */
         struct io *pending_io;
@@ -154,7 +167,10 @@ struct cache_band {
         unsigned long *map;
 };
 
+
 /*
+ * TODO: Fix these comments, they are not up to date.
+ *
  * This represents a single I/O operation, either read or write.  The |bio|
  * associated with it may result in multiple bios being generated, all of which
  * should complete before this one can be considered complete.  Every generated
@@ -214,6 +230,7 @@ static void release_io(struct io *io)
 
         WARN_ON(atomic_read(&io->pending));
         mempool_free(io, sc->io_pool);
+        sc->error = error;
 
         if (bio)
                 bio_endio(bio, error);
@@ -298,33 +315,42 @@ static inline int32_t free_pbas_in_cache_band(struct sadc_c *sc,
         return sc->band_size_pbas - (cb->current_pba - cb->begin_pba);
 }
 
-static void gc(struct sadc_c *sc, int error);
-static void free_bio_pages(struct sadc_c *sc, struct bio *bio);
+static void do_free_bio_pages(struct sadc_c *sc, struct bio *bio)
+{
+        int i;
+        struct bio_vec *bv;
+
+        bio_for_each_segment_all(bv, bio, i) {
+                WARN_ON(!bv->bv_page);
+                mempool_free(bv->bv_page, sc->page_pool);
+                bv->bv_page = NULL;
+        }
+
+        /* For now we should only have a single page per bio. */
+        WARN_ON(i != 1);
+}
 
 static void endio(struct bio *bio, int error)
 {
         struct io *io = bio->bi_private;
         struct sadc_c *sc = io->sc;
-        bool gc_io = io->bio == NULL;
+        bool rmw_bio = io->bio == NULL;
+        bool rmw_complete = rmw_bio && (bio_data_dir(bio) == WRITE);
 
         debug_bio(sc, bio, __func__);
 
         if (unlikely(!bio_flagged(bio, BIO_UPTODATE) && !error))
                 io->error = -EIO;
 
-        /*
-         * This is a bio from the write stage of RMW.  We should release the
-         * page we allocated in the read stage.
-         */
-        if (bio_data_dir(bio) == WRITE && gc_io)
-                free_bio_pages(sc, bio);
+        if (rmw_complete)
+                do_free_bio_pages(sc, bio);
 
         bio_put(bio);
 
         if (atomic_dec_and_test(&io->pending)) {
                 release_io(io);
-                if (gc_io)
-                        gc(sc, error);
+                if (rmw_bio)
+                        complete(&sc->rmw_stage_comp);
         }
 }
 
@@ -651,6 +677,7 @@ static void do_start_gc(struct sadc_c *sc)
         int32_t nr_pbas = pbas_in_band(sc, bio, b);
         struct cache_band *cb = cache_band(sc, b);
 
+        WARN_ON(sc->error);
         WARN_ON(does_not_require_gc(sc, bio));
 
         DMINFO("Starting GC...");
@@ -729,23 +756,6 @@ static struct bio *alloc_bio_with_page(struct sadc_c *sc, lba_t lba)
         return bio;
 }
 
-static void free_bio_pages(struct sadc_c *sc, struct bio *bio)
-{
-        int i;
-        struct bio_vec *bv;
-
-        bio_for_each_segment_all(bv, bio, i) {
-                WARN_ON(!bv->bv_page);
-                mempool_free(bv->bv_page, sc->page_pool);
-                bv->bv_page = NULL;
-        }
-
-        /*
-         * For now we should only have a single page per bio.
-         */
-        WARN_ON(i != 1);
-}
-
 static bool allocate_rmw_bios(struct sadc_c *sc)
 {
         pba_t pba;
@@ -764,22 +774,23 @@ static bool allocate_rmw_bios(struct sadc_c *sc)
 
 bad:
         while (i--) {
-                free_bio_pages(sc, sc->rmw_bios[i]);
+                do_free_bio_pages(sc, sc->rmw_bios[i]);
                 bio_put(sc->rmw_bios[i]);
         }
         return false;
 }
 
-static int do_start_cache_band_gc(struct sadc_c *sc)
+static void do_start_cache_band_gc(struct sadc_c *sc)
 {
+        WARN_ON(sc->error);
+
         sc->state = STATE_READ_DATA_BAND;
         set_rmw_band(sc);
 
-        if (!allocate_rmw_bios(sc))
-                return -ENOMEM;
-
         pr_debug("sc->rmw_band -> %d\n", sc->rmw_band);
-        return 0;
+
+        if (!allocate_rmw_bios(sc))
+                sc->error = -ENOMEM;
 }
 
 static struct bio *tmp_clone_bio(struct io *io, struct bio *bio, lba_t lba)
@@ -801,21 +812,21 @@ static struct bio *tmp_clone_bio(struct io *io, struct bio *bio, lba_t lba)
         return clone;
 }
 
-static int do_read_data_band(struct sadc_c *sc, int error)
+static void do_read_data_band(struct sadc_c *sc)
 {
         struct io *io;
         pba_t pba;
         int32_t i;
 
+        WARN_ON(sc->error);
         WARN_ON(sc->rmw_band == -1);
         sc->state = STATE_MODIFY_DATA_BAND;
 
-        if (error)
-                return error;
-
         io = alloc_io(sc, NULL);
-        if (unlikely(!io))
-                return -ENOMEM;
+        if (unlikely(!io)) {
+                sc->error = -ENOMEM;
+                return;
+        }
 
         pba = band_begin_pba(sc, sc->rmw_band);
 
@@ -830,31 +841,32 @@ static int do_read_data_band(struct sadc_c *sc, int error)
         for (i = 0; i < sc->band_size_pbas; ++i)
                 generic_make_request(sc->tmp_bios[i]);
 
-        return -EINPROGRESS;
+        sc->error = -EINPROGRESS;
+        return;
 
 bad:
         while (i--)
                 release_bio(sc->tmp_bios[i]);
         release_io(io);
 
-        return -ENOMEM;
+        sc->error = -ENOMEM;
 }
 
-static int do_modify_data_band(struct sadc_c *sc, int error)
+static void do_modify_data_band(struct sadc_c *sc)
 {
         struct io *io;
         pba_t pba;
         int32_t i, j;
 
+        WARN_ON(sc->error);
         WARN_ON(sc->rmw_band == -1);
         sc->state = STATE_WRITE_DATA_BAND;
 
-        if (error)
-                return error;
-
         io = alloc_io(sc, NULL);
-        if (!io)
-                return -ENOMEM;
+        if (!io) {
+                sc->error = -ENOMEM;
+                return;
+        }
 
         pba = band_begin_pba(sc, sc->rmw_band);
 
@@ -879,30 +891,31 @@ static int do_modify_data_band(struct sadc_c *sc, int error)
         for (i = 0; i < j; ++i)
                 generic_make_request(sc->tmp_bios[i]);
 
-        return -EINPROGRESS;
+        sc->error = -EINPROGRESS;
+        return;
 
 bad:
         while (j--)
                 release_bio(sc->tmp_bios[j]);
         release_io(io);
 
-        return -ENOMEM;
+        sc->error = -ENOMEM;
 }
 
-static int do_write_data_band(struct sadc_c *sc, int error)
+static void do_write_data_band(struct sadc_c *sc)
 {
         struct io *io;
         int i;
 
+        WARN_ON(sc->error);
         WARN_ON(sc->rmw_band == -1);
         sc->state = STATE_RMW_COMPLETE;
 
-        if (error)
-                return error;
-
         io = alloc_io(sc, NULL);
-        if (!io)
-                return -ENOMEM;
+        if (!io) {
+                sc->error = -ENOMEM;
+                return;
+        }
 
         for (i = 0; i < sc->band_size_pbas; ++i) {
                 sc->rmw_bios[i]->bi_private = io;
@@ -913,7 +926,7 @@ static int do_write_data_band(struct sadc_c *sc, int error)
 
                 generic_make_request(sc->rmw_bios[i]);
         }
-        return -EINPROGRESS;
+        sc->error = -EINPROGRESS;
 }
 
 static bool no_bands_to_clean(struct sadc_c *sc)
@@ -921,12 +934,10 @@ static bool no_bands_to_clean(struct sadc_c *sc)
         return bitmap_weight(sc->gc_band->map, sc->cache_assoc) == 0;
 }
 
-static int do_rmw_complete(struct sadc_c *sc, int error)
+static void do_rmw_complete(struct sadc_c *sc)
 {
+        WARN_ON(sc->error);
         WARN_ON(sc->rmw_band == -1);
-
-        if (error)
-                return error;
 
         clear_rmw_band(sc);
 
@@ -934,8 +945,6 @@ static int do_rmw_complete(struct sadc_c *sc, int error)
                 sc->state = STATE_GC_COMPLETE;
         else
                 sc->state = STATE_START_CACHE_BAND_GC;
-
-        return 0;
 }
 
 static void queue_io(struct io *io);
@@ -944,6 +953,8 @@ static void do_gc_complete(struct sadc_c *sc)
 {
         struct io *io = sc->pending_io;
         struct bio *bio = io->bio;
+
+        WARN_ON(sc->error);
 
         reset_cache_band(sc, sc->gc_band);
         sc->gc_band = NULL;
@@ -965,6 +976,11 @@ static void do_fail_gc(struct sadc_c *sc)
 {
         struct io *io = sc->pending_io;
 
+        /*
+         * Currently, we treat all errors as IO errors, but if need be, the
+         * actual error code is available in sc->error.
+         */
+        sc->error = 0;
         sc->state = STATE_NONE;
         sc->pending_io = NULL;
         sc->gc_band = NULL;
@@ -976,9 +992,11 @@ static void do_fail_gc(struct sadc_c *sc)
         release_io(io);
 }
 
-static void gc(struct sadc_c *sc, int error)
+static void gc(struct sadc_c *sc)
 {
         WARN_ON(sc->state == STATE_NONE);
+        WARN_ON(sc->error);
+
         do {
                 int state = sc->state;
                 sc->state = STATE_NONE;
@@ -986,43 +1004,51 @@ static void gc(struct sadc_c *sc, int error)
                 switch (state) {
                 case STATE_START_GC:
                         pr_debug("STATE_START_GC\n");
-                        WARN_ON(error);
                         do_start_gc(sc);
                         break;
                 case STATE_START_CACHE_BAND_GC:
                         pr_debug("STATE_START_CACHE_BAND_GC\n");
-                        WARN_ON(error);
-                        error = do_start_cache_band_gc(sc);
+                        do_start_cache_band_gc(sc);
                         break;
                 case STATE_READ_DATA_BAND:
                         pr_debug("STATE_READ_DATA_BAND\n");
-                        error = do_read_data_band(sc, error);
+                        do_read_data_band(sc);
                         break;
                 case STATE_MODIFY_DATA_BAND:
                         pr_debug("STATE_MODIFY_DATA_BAND\n");
-                        error = do_modify_data_band(sc, error);
+                        do_modify_data_band(sc);
                         break;
                 case STATE_WRITE_DATA_BAND:
                         pr_debug("STATE_WRITE_DATA_BAND\n");
-                        error = do_write_data_band(sc, error);
+                        do_write_data_band(sc);
                         break;
                 case STATE_RMW_COMPLETE:
                         pr_debug("STATE_RMW_COMPLETE\n");
-                        error = do_rmw_complete(sc, error);
+                        do_rmw_complete(sc);
                         break;
                 case STATE_GC_COMPLETE:
                         pr_debug("STATE_GC_COMPLETE\n");
-                        WARN_ON(error);
                         do_gc_complete(sc);
                         break;
                 default:
                         WARN_ON(1);
                         break;
                 }
-        } while (!error && sc->state != STATE_NONE);
 
-        if (sc->state != STATE_NONE && error != -EINPROGRESS)
+                if (sc->error == -EINPROGRESS) {
+                        wait_for_completion(&sc->rmw_stage_comp);
+                        reinit_completion(&sc->rmw_stage_comp);
+                }
+
+                if (sc->error)
+                        break;
+
+        } while (sc->state != STATE_NONE);
+
+        if (sc->error) {
+                WARN_ON(sc->error == -EINPROGRESS);
                 do_fail_gc(sc);
+        }
 }
 
 static void start_gc(struct sadc_c *sc, struct io *io)
@@ -1033,7 +1059,7 @@ static void start_gc(struct sadc_c *sc, struct io *io)
 
         sc->pending_io = io;
         sc->state = STATE_START_GC;
-        gc(sc, 0);
+        gc(sc);
 }
 
 /*
@@ -1246,6 +1272,7 @@ static int sadc_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         }
 
         mutex_init(&sc->c_lock);
+        init_completion(&sc->rmw_stage_comp);
 
         /* TODO: Reconsider proper values for these. */
         ti->num_flush_bios = 1;

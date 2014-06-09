@@ -30,9 +30,7 @@ const (
 	lbaSize        = 512
 
 	moduleName   = "sadc"
-	loopDevice   = "/dev/loop0"
-	fileName     = moduleName + ".img"
-	fileSize     = diskSize
+	blockDevice  = "/dev/sdb"
 	modulePath   = "dm-" + moduleName + ".ko"
 	moduleRmName = "dm_" + moduleName
 	targetName   = moduleName
@@ -110,11 +108,9 @@ func setup() {
 	runCmd("make clean")
 	runCmd("make")
 	runCmd("sudo insmod " + modulePath)
-	runCmd("fallocate -l " + strconv.Itoa(2*fileSize) + " " + fileName)
-	runCmd("sudo losetup " + loopDevice + " " + fileName)
 
 	c := fmt.Sprintf("echo 0 %d %s %s %d %d %d %d | sudo dmsetup create %s",
-		numUsableSectors(), targetName, loopDevice, trackSize,
+		numUsableSectors(), targetName, blockDevice, trackSize,
 		bandSizeTracks, cachePercent, diskSize, targetName)
 	runCmd(c)
 }
@@ -124,8 +120,6 @@ func tearDown() {
 
 	runCmd("sudo dmsetup remove " + targetName)
 	runCmd("sudo rmmod " + moduleRmName)
-	runCmd("sudo losetup -d " + loopDevice)
-	runCmd("rm " + fileName)
 }
 
 // Allocates aligned blocks for direct I/O.
@@ -158,7 +152,7 @@ func writeBlocks(f *os.File, blockNo, count int, pattern string) {
 }
 
 // Reads |count| number of blocks starting at |blockNo| and verifies that the
-// read blocks are filled with |c|.
+// read blocks' contents match the |pattern|.
 func readBlocks(f *os.File, blockNo, count int, pattern string) {
 	b := alignedBlocks(count, strings.Repeat("!", count))
 
@@ -172,7 +166,9 @@ func readBlocks(f *os.File, blockNo, count int, pattern string) {
 		}
 		for j := 0; j < blockSize; j++ {
 			if b[i*blockSize+j] != pattern[i] {
-				panicf("Expected %c, got %c", pattern[i], b[i])
+				panicf("Expected %c, got %c",
+					pattern[i],
+					b[i*blockSize+j])
 			}
 		}
 	}
@@ -192,16 +188,16 @@ func doResetDisk() {
 		panicf("Resetting %s failed: %v", targetDevice, errr)
 	}
 
-	f, err := os.OpenFile(fileName, os.O_RDWR|syscall.O_DIRECT, 0666)
+	f, err := os.OpenFile(blockDevice, os.O_RDWR|syscall.O_DIRECT, 0666)
 	if err != nil {
-		panicf("os.OpenFile(%s) failed: %v", fileName, err)
+		panicf("os.OpenFile(%s) failed: %v", blockDevice, err)
 	}
 	defer f.Close()
 
 	b := alignedBlocks(1, "\x00")
 	for i := 0; i < diskSize/blockSize; i++ {
 		if _, err := f.Write(b); err != nil {
-			panicf("Failed to write to %s: %v", fileName, err)
+			panicf("Failed to write to %s: %v", blockDevice, err)
 		}
 	}
 }
@@ -327,7 +323,7 @@ func doTest(i int, t *Test) {
 	defer f.Close()
 
 	c := fmt.Sprintf("sudo blktrace -d %s -o - | blkparse -FQ,%s -i -",
-		loopDevice, `!%d,%S,%n\n`)
+		blockDevice, `!%d,%S,%n\n`)
 	pipe := startCmd(c)
 	defer func() {
 		pipe.Close()
@@ -342,9 +338,9 @@ func doTest(i int, t *Test) {
 	go readBtEvents(pipe, ch, len(expectedEvents))
 
 	// Although at this point blktrace has already started running, there is
-	// a race between blktrace issuing BLKTRACESETUP to the loopback device
-	// and us executing the user commands.  Since there is no way of finding
-	// out whether blktrace has issued BLKTRACESETUP, we sleep here and hope
+	// a race between blktrace issuing BLKTRACESETUP to the block device and
+	// us executing the user commands.  Since there is no way of finding out
+	// whether blktrace has issued BLKTRACESETUP, we sleep here and hope
 	// that it does so before we start executing commands.
 	time.Sleep(1 * time.Second)
 	for _, cmd := range strings.Split(t.userCmds, ",") {

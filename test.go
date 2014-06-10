@@ -142,18 +142,19 @@ func alignedBlocks(count int, pattern string) []byte {
 }
 
 // Writes |count| number of blocks filled with |c|, starting at |blockNo|.
-func writeBlocks(f *os.File, blockNo, count int, pattern string) {
+func writeBlocks(f *os.File, blockNo, count int, pattern string) string {
 	b := alignedBlocks(count, pattern)
 
 	offset := int64(blockNo * blockSize)
 	if _, err := f.WriteAt(b, offset); err != nil {
-		panicf("Write failed: %v", err)
+		return fmt.Sprintf("Write failed: %v", err)
 	}
+	return ""
 }
 
 // Reads |count| number of blocks starting at |blockNo| and verifies that the
 // read blocks' contents match the |pattern|.
-func readBlocks(f *os.File, blockNo, count int, pattern string) {
+func readBlocks(f *os.File, blockNo, count int, pattern string) string {
 	b := alignedBlocks(count, strings.Repeat("!", count))
 
 	offset := int64(blockNo * blockSize)
@@ -166,12 +167,13 @@ func readBlocks(f *os.File, blockNo, count int, pattern string) {
 		}
 		for j := 0; j < blockSize; j++ {
 			if b[i*blockSize+j] != pattern[i] {
-				panicf("Expected %c, got %c",
+				return fmt.Sprintf("Expected %c, got %c",
 					pattern[i],
 					b[i*blockSize+j])
 			}
 		}
 	}
+	return ""
 }
 
 // Sends IOCTL to SMR emulator target to reset its state.  Also, overwrite the
@@ -202,22 +204,17 @@ func doResetDisk() {
 	}
 }
 
-// A test consists of two strings: |userCmds| is a comma separated list of user
-// commands to execute, |btEvents| is a comma separated list of blktrace events
-// we expect due to these commands.
-type Test struct {
-	userCmds string
-	btEvents string
-}
-
 // Verifies syntax of the tests.
-func verify(tests []*Test) {
+func verify(tests []string) {
 	var userCmdRegexp = regexp.MustCompile(`^[wr]\s[a-z_]+\s\d+\s\d+$`)
 	var btEventRegexp = regexp.MustCompile(`^[wr]\s\d+\s\d+$`)
 
 	fmt.Println("Verifying syntax of tests...")
 	for i, t := range tests {
-		for _, c := range strings.Split(t.userCmds, ",") {
+		fields := strings.Split(t, ":")
+		userCmds, btEvents := fields[0], fields[1]
+
+		for _, c := range strings.Split(userCmds, ",") {
 			if !userCmdRegexp.MatchString(c) {
 				panicf("Bad user command %d: %s", i, c)
 			}
@@ -227,7 +224,7 @@ func verify(tests []*Test) {
 				panicf("Bad user command %d: %s", i, c)
 			}
 		}
-		for _, e := range strings.Split(t.btEvents, ",") {
+		for _, e := range strings.Split(btEvents, ",") {
 			if !btEventRegexp.MatchString(e) {
 				panicf("Bad blktrace event d: %s", i, e)
 			}
@@ -236,17 +233,22 @@ func verify(tests []*Test) {
 }
 
 // Executes a user test command.
-func doUserCmd(f *os.File, cmd string) {
+func doUserCmd(f *os.File, cmd string) string {
 	fs := strings.Fields(cmd)
 	operation, pattern := fs[0], fs[1]
 	offset, _ := strconv.Atoi(fs[2])
 	count, _ := strconv.Atoi(fs[3])
 
+	var s string
 	if operation == "w" {
-		writeBlocks(f, offset, count, pattern)
+		s = writeBlocks(f, offset, count, pattern)
 	} else {
-		readBlocks(f, offset, count, pattern)
+		s = readBlocks(f, offset, count, pattern)
 	}
+	if s != "" {
+		s += " [" + cmd + "]"
+	}
+	return s
 }
 
 // Reads blktrace events from |pipe|.
@@ -282,7 +284,8 @@ func readBtEvents(pipe io.ReadCloser, ch chan []string, count int) {
 }
 
 func frame(s string) string {
-	return fmt.Sprintf("\n-------\n%s\n-------\n", s)
+	border := strings.Repeat("-", len(s))
+	return fmt.Sprintf("%s\n%s\n%s", border, s, border)
 }
 
 // Converts blktrace event to our test format.
@@ -315,7 +318,7 @@ func eventsMatch(expectedEvents, readEvents []string) bool {
 	return true
 }
 
-func doTest(i int, t *Test) {
+func doTest(i int, test string) {
 	f, err := os.OpenFile(targetDevice, os.O_RDWR|syscall.O_DIRECT, 0666)
 	if err != nil {
 		panicf("os.OpenFile(%s) failed: %v", targetDevice, err)
@@ -332,7 +335,10 @@ func doTest(i int, t *Test) {
 
 	fmt.Printf("Running test %3d: ", i)
 
-	expectedEvents := strings.Split(t.btEvents, ",")
+	fields := strings.Split(test, ":")
+	userCmds, btEvents := fields[0], fields[1]
+
+	expectedEvents := strings.Split(btEvents, ",")
 
 	ch := make(chan []string)
 	go readBtEvents(pipe, ch, len(expectedEvents))
@@ -343,8 +349,11 @@ func doTest(i int, t *Test) {
 	// whether blktrace has issued BLKTRACESETUP, we sleep here and hope
 	// that it does so before we start executing commands.
 	time.Sleep(1 * time.Second)
-	for _, cmd := range strings.Split(t.userCmds, ",") {
-		doUserCmd(f, cmd)
+	for _, cmd := range strings.Split(userCmds, ",") {
+		if s := doUserCmd(f, cmd); s != "" {
+			panicf("User command failed for the test\n%s\n\n%s",
+				frame(test), s)
+		}
 	}
 
 	readEvents := <-ch
@@ -353,14 +362,15 @@ func doTest(i int, t *Test) {
 	if eventsMatch(expectedEvents, readEvents) {
 		fmt.Println("ok")
 	} else {
-		panicf("Failed: %s\n",
-			fmt.Sprintf("Expected %s got %s",
+		panicf("Blktrace validation failed for the test\n%s\n\n%s",
+			frame(test),
+			fmt.Sprintf("Expected\n%s\ngot\n%s",
 				frame(strings.Join(expectedEvents, "\n")),
 				frame(strings.Join(readEvents, "\n"))))
 	}
 }
 
-func readTests(fileName string) (tests []*Test) {
+func readTests(fileName string) (tests []string) {
 	f, err := os.Open(fileName)
 	if err != nil {
 		panicf("os.Open(%s) failed: %s\n", fileName, err)
@@ -373,8 +383,7 @@ func readTests(fileName string) (tests []*Test) {
 		if s == "" || strings.HasPrefix(s, "#") {
 			continue
 		}
-		f := strings.Split(s, ":")
-		tests = append(tests, &Test{f[0], f[1]})
+		tests = append(tests, s)
 	}
 	return
 }

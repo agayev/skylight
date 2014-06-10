@@ -543,6 +543,7 @@ static void init_bio(struct io *io, struct bio *bio,
         bio->bi_private = io;
         bio->bi_end_io = endio;
         bio->bi_idx = idx;
+        bio->bi_vcnt = idx + nr_pbas;
         bio->bi_sector = lba;
         bio->bi_size = nr_pbas * PBA_SIZE;
         bio->bi_bdev = sc->dev->bdev;
@@ -629,7 +630,7 @@ bad:
 
 typedef int (*split_t)(struct sadc_c *sc, struct io *io, struct bio **bios);
 
-static void complete_delayed_io(struct sadc_c *sc, struct io *io, split_t split)
+static void complete_split_io(struct sadc_c *sc, struct io *io, split_t split)
 {
         int i, n;
 
@@ -1074,9 +1075,9 @@ static void sadcd(struct work_struct *work)
         WARN_ON(!aligned(bio));
 
         if (bio_data_dir(bio) == READ)
-                complete_delayed_io(sc, io, split_read_bio);
+                complete_split_io(sc, io, split_read_bio);
         else if (does_not_require_gc(sc, bio))
-                complete_delayed_io(sc, io, split_write_bio);
+                complete_split_io(sc, io, split_write_bio);
         else
                 start_gc(sc, io);
 }

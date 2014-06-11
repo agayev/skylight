@@ -130,7 +130,12 @@ struct sadc_c {
         /* Current state of the GC state machine. */
         enum state state;
 
-        /* Error generated during the execution of the last state. */
+        /*
+         * Error generated during the execution of the last state.  Although
+         * this variable is read/written by the main thread and the GC thread,
+         * we ensure that only one of those threads can be active at any given
+         * time.
+         */
         int error;
 
         /* io that is currently pending due to GC. */
@@ -225,15 +230,16 @@ static struct io *alloc_io(struct sadc_c *sc, struct bio *bio)
 static void release_io(struct io *io)
 {
         struct sadc_c *sc = io->sc;
-        struct bio *bio = io->bio;
+        bool rmw_bio = io->bio == NULL;
         int error = io->error;
 
         WARN_ON(atomic_read(&io->pending));
         mempool_free(io, sc->io_pool);
-        sc->error = error;
 
-        if (bio)
-                bio_endio(bio, error);
+        if (rmw_bio)
+                sc->error = error;
+        else
+                bio_endio(io->bio, error);
 }
 
 static inline bool data_pba(struct sadc_c *sc, pba_t pba)
@@ -839,10 +845,11 @@ static void do_read_data_band(struct sadc_c *sc)
                         goto bad;
         }
 
+        sc->error = -EINPROGRESS;
+
         for (i = 0; i < sc->band_size_pbas; ++i)
                 generic_make_request(sc->tmp_bios[i]);
 
-        sc->error = -EINPROGRESS;
         return;
 
 bad:
@@ -889,10 +896,11 @@ static void do_modify_data_band(struct sadc_c *sc)
          */
         WARN_ON(!j);
 
+        sc->error = -EINPROGRESS;
+
         for (i = 0; i < j; ++i)
                 generic_make_request(sc->tmp_bios[i]);
 
-        sc->error = -EINPROGRESS;
         return;
 
 bad:
@@ -918,16 +926,16 @@ static void do_write_data_band(struct sadc_c *sc)
                 return;
         }
 
+        sc->error = -EINPROGRESS;
+
+        atomic_set(&io->pending, sc->band_size_pbas);
+
         for (i = 0; i < sc->band_size_pbas; ++i) {
                 sc->rmw_bios[i]->bi_private = io;
                 sc->rmw_bios[i]->bi_end_io = endio;
                 sc->rmw_bios[i]->bi_rw = WRITE;
-
-                atomic_inc(&io->pending);
-
                 generic_make_request(sc->rmw_bios[i]);
         }
-        sc->error = -EINPROGRESS;
 }
 
 static bool no_bands_to_clean(struct sadc_c *sc)
@@ -1036,10 +1044,9 @@ static void gc(struct sadc_c *sc)
                         break;
                 }
 
-                if (sc->error == -EINPROGRESS) {
+                if (sc->error == -EINPROGRESS)
                         wait_for_completion(&sc->rmw_stage_comp);
-                        reinit_completion(&sc->rmw_stage_comp);
-                }
+                reinit_completion(&sc->rmw_stage_comp);
 
                 if (sc->error)
                         break;

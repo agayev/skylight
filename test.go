@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	retryCount = 4
+	retryCount = 1
 
 	resetDisk      = 0xDEADBEEF
 	diskSize       = 76 << 10
@@ -275,10 +275,10 @@ func readBtEvents(pipe io.ReadCloser, ch chan []string, count int) {
 		if len(events) == count {
 			break
 		}
-		i++
 		if i == retryCount {
 			break
 		}
+		i++
 	}
 	ch <- events
 }
@@ -330,7 +330,6 @@ func doTest(i int, test string) {
 	pipe := startCmd(c)
 	defer func() {
 		pipe.Close()
-		runCmd("sudo pkill -15 blktrace")
 	}()
 
 	fmt.Printf("Running test %3d: ", i)
@@ -355,6 +354,7 @@ func doTest(i int, test string) {
 				frame(test), s)
 		}
 	}
+	runCmd("sudo pkill -15 blktrace")
 
 	readEvents := <-ch
 	close(ch)

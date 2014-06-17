@@ -25,13 +25,10 @@
  * Important TODOs.
  *
  * TODO: Test error checking: try failing state machine functions one by one.
- * TODO: Reconsider clone_bio -- is it necessary?
  * TODO: Consider turning some WARN_ONs to debug mode only.
- * TODO: Reconsider lba/pba boundaries.
  * TODO: Revisit cache_band, band, etc.
  * TODO: Post and pre-conditions for all functions.
  * TODO: Consider every functions signature.
- * TODO: Consider names.
  * TODO: Fix comments to be consistent.
  */
 
@@ -102,16 +99,19 @@ struct sadc_c {
         /* Number of usable pbas.  Excludes the cache region. */
         int32_t nr_data_pbas;
 
-        /* Maps a pba to its location in the cache region.  Contains -1 for
-         * unmapped pbas. */
+        /*
+         * Maps a pba to its location in the cache region.  Contains -1 for
+         * unmapped pbas.
+         */
         pba_t *pba_map;
 
         struct cache_band *cache_bands;
 
         int32_t nr_bands;    /* Total number of available bands. */
 
-        /* Number of data bands.  These make up the usable region of the
-         * disk. */
+        /*
+         * Number of data bands.  These make up the usable region of the disk.
+         */
         int32_t nr_data_bands;
 
         /* Number of data bands associated with each cache band. */
@@ -121,8 +121,10 @@ struct sadc_c {
         mempool_t *page_pool; /* For GC bio pages. */
         struct bio_set *bs;   /* For cloned bios. */
 
-        /* All read and write operations will be put into this queue and will
-         * be performed by worker threads. */
+        /*
+         * All read and write operations will be put into this queue and will be
+         * performed by worker threads.
+         */
         struct workqueue_struct *queue;
 
         /* GC related stuff follows. */
@@ -174,8 +176,6 @@ struct cache_band {
 
 
 /*
- * TODO: Fix these comments, they are not up to date.
- *
  * This represents a single I/O operation, either read or write.  The |bio|
  * associated with it may result in multiple bios being generated, all of which
  * should complete before this one can be considered complete.  Every generated
@@ -185,8 +185,9 @@ struct cache_band {
  *
  * If |bio| is NULL, then it is a GC generated I/O operation.  Again, it usually
  * results in multiple bios which increment |pending| upon launch and decrement
- * it upon completion.  However, the non-NULL |bio| case, when all of the bios
- * are complete, |endio| returns to GC state machine by invoking |gc|.
+ * it upon completion.  However, in the non-NULL |bio| case, when all of the
+ * bios are complete, |endio| signals the worker thread sleeping in state
+ * machine to wake up and proceed.
  */
 struct io {
         struct sadc_c *sc;
@@ -264,13 +265,13 @@ static inline bool data_band(struct sadc_c *sc, int32_t band)
  * Since we work with 4 KB blocks, number of pbas is equivalent to the number of
  * segments.
  */
-#define bio_pbas bio_segments
+#define pbas_in_bio bio_segments
 
-#define bio_begin_lba(bio) ((bio)->bi_sector)
-#define bio_end_lba bio_end_sector
+#define bio_begin_lba(bio)   ((bio)->bi_sector)
+#define bio_end_lba          bio_end_sector
 
-#define bio_begin_pba(bio) (lba_to_pba(bio_begin_lba(bio)))
-#define bio_end_pba(bio) (lba_to_pba(bio_end_lba(bio)))
+#define bio_begin_pba(bio)   (lba_to_pba(bio_begin_lba(bio)))
+#define bio_end_pba(bio)     (lba_to_pba(bio_end_lba(bio)))
 
 static inline pba_t band_begin_pba(struct sadc_c *sc, int32_t band)
 {
@@ -293,7 +294,6 @@ static inline void debug_bio(struct sadc_c *sc, struct bio *bio, const char *f)
                  bio->bi_size / PBA_SIZE);
 }
 
-/* Returns the band on which |pba| resides. */
 static inline int32_t band(struct sadc_c *sc, pba_t pba)
 {
         WARN_ON(!data_pba(sc, pba));
@@ -306,7 +306,6 @@ static inline int32_t bio_band(struct sadc_c *sc, struct bio *bio)
         return band(sc, bio_begin_pba(bio));
 }
 
-/* Returns the cache band for the |band|. */
 static inline struct cache_band *cache_band(struct sadc_c *sc, int32_t band)
 {
         WARN_ON(!data_band(sc, band));
@@ -314,7 +313,6 @@ static inline struct cache_band *cache_band(struct sadc_c *sc, int32_t band)
         return &sc->cache_bands[band % sc->nr_cache_bands];
 }
 
-/* Returns available space in pbas in cache band |cb|.  */
 static inline int32_t free_pbas_in_cache_band(struct sadc_c *sc,
                                               struct cache_band *cb)
 {
@@ -386,7 +384,7 @@ static int reset_disk(struct sadc_c *sc)
         return 0;
 }
 
-/* Returns bands position in |cb|'s bitmap. */
+/* Returns band's position in |cb|'s bitmap. */
 static inline int band_to_pos(struct sadc_c *sc, struct cache_band *cb,
                               int32_t band)
 {
@@ -399,7 +397,6 @@ static inline int pos_to_band(struct sadc_c *sc, struct cache_band *cb, int pos)
         return pos * sc->nr_cache_bands + cb->nr;
 }
 
-/* Returns PBA to which |pba| was mapped. */
 static pba_t lookup_pba(struct sadc_c *sc, pba_t pba)
 {
         WARN_ON(!data_pba(sc, pba));
@@ -409,48 +406,42 @@ static pba_t lookup_pba(struct sadc_c *sc, pba_t pba)
         return sc->pba_map[pba];
 }
 
-/* Returns LBA to which |lba| was mapped. */
-static lba_t lookup_lba(struct sadc_c *sc, lba_t lba)
+static pba_t map_pba_range(struct sadc_c *sc, pba_t begin, pba_t end)
 {
-        return pba_to_lba(lookup_pba(sc, lba_to_pba(lba))) + lba % LBAS_IN_PBA;
-}
-
-static pba_t map_pba(struct sadc_c *sc, pba_t pba)
-{
-        struct cache_band *cb;
+        pba_t i;
         int32_t b;
+        struct cache_band *cb;
 
-        WARN_ON(!data_pba(sc, pba));
+        WARN_ON(begin >= end);
+        WARN_ON(!data_pba(sc, end-1));
 
-        b = band(sc, pba);
+        b = band(sc, begin);
+
+        WARN_ON(b != band(sc, end-1));
+
         cb = cache_band(sc, b);
 
-        WARN_ON(!free_pbas_in_cache_band(sc, cb));
+        WARN_ON(free_pbas_in_cache_band(sc, cb) < (end - begin));
 
-        sc->pba_map[pba] = cb->current_pba++;
+        for (i = begin; i < end; ++i)
+                sc->pba_map[i] = cb->current_pba++;
+
         set_bit(band_to_pos(sc, cb, b), cb->map);
 
-        return sc->pba_map[pba];
+        return sc->pba_map[begin];
 }
 
-static lba_t map_lba(struct sadc_c *sc, lba_t lba)
+static bool adjacent_pbas(struct sadc_c *sc, pba_t x, pba_t y)
 {
-        return pba_to_lba(map_pba(sc, lba_to_pba(lba)));
+        return lookup_pba(sc, x) + 1 == lookup_pba(sc, y);
 }
 
-static bool adjacent(struct sadc_c *sc, pba_t x, pba_t y)
+static bool contiguous_bio(struct sadc_c *sc, struct bio *bio)
 {
-        return lookup_pba(sc, x)+1 == lookup_pba(sc, y);
-}
+        int i;
 
-/* Returns whether a |bio| is contiguously mapped. */
-static bool contiguous(struct sadc_c *sc, struct bio *bio)
-{
-        pba_t pba = bio_begin_pba(bio);
-        pba_t end_pba = bio_end_pba(bio);
-
-        for ( ; pba < end_pba-1; ++pba)
-                if (!adjacent(sc, pba, pba+1))
+        for (i = bio_begin_pba(bio); i < bio_end_pba(bio)-1; ++i)
+                if (!adjacent_pbas(sc, i, i + 1))
                         return false;
         return true;
 }
@@ -467,27 +458,28 @@ static int32_t pbas_in_band(struct sadc_c *sc, struct bio *bio, int32_t band)
 }
 
 /*
- * Returns whether |bio| crosses bands.  Given the sizes at the top of this file
- * and the fact that the kernel does not allow bios larger than 512 KB (I need
- * to confirm this), we assume that a bio can cross at most two bands.
+ * Returns whether |bio| crosses bands.  We assume that a bio can never be
+ * larger than a band.  This is true in practice.
  */
-static bool does_not_cross_bands(struct sadc_c *sc, struct bio *bio)
+static bool does_not_cross_bands_bio(struct sadc_c *sc, struct bio *bio)
 {
         int32_t b = bio_band(sc, bio) + 1;
 
-        if (b >= sc->nr_data_bands)
+        WARN_ON(b > sc->nr_data_bands);
+
+        if (b == sc->nr_data_bands)
                 return true;
         return bio_end_pba(bio) <= band_begin_pba(sc, b);
 }
 
 /* Returns whether |bio| is 4 KB aligned.  */
-static bool aligned(struct bio *bio)
+static bool aligned_bio(struct bio *bio)
 {
         return !(bio_begin_lba(bio) & 0x7) && !(bio->bi_size & 0xfff);
 }
 
 /* Returns whether writing |bio| to the cache band will cause GC.  */
-static bool does_not_require_gc(struct sadc_c *sc, struct bio *bio)
+static bool does_not_require_gc_bio(struct sadc_c *sc, struct bio *bio)
 {
         int32_t b = bio_band(sc, bio);
         struct cache_band *cb = cache_band(sc, b);
@@ -496,7 +488,7 @@ static bool does_not_require_gc(struct sadc_c *sc, struct bio *bio)
         if (free_pbas_in_cache_band(sc, cb) < nr_pbas)
                 return false;
 
-        nr_pbas = bio_pbas(bio) - nr_pbas;
+        nr_pbas = pbas_in_bio(bio) - nr_pbas;
         if (!nr_pbas)
                 return true;
 
@@ -505,58 +497,33 @@ static bool does_not_require_gc(struct sadc_c *sc, struct bio *bio)
 }
 
 /* Returns true if |bio| can complete just by doing a remap. */
-static bool fast(struct sadc_c *sc, struct bio *bio)
+static bool fast_bio(struct sadc_c *sc, struct bio *bio)
 {
         if (bio_data_dir(bio) == READ)
-                return contiguous(sc, bio);
+                return contiguous_bio(sc, bio);
 
-        return aligned(bio) &&
-                does_not_cross_bands(sc, bio) &&
-                does_not_require_gc(sc, bio);
+        return aligned_bio(bio) &&
+                does_not_cross_bands_bio(sc, bio) &&
+                does_not_require_gc_bio(sc, bio);
 }
 
-static void remap(struct sadc_c *sc, struct bio *bio)
+static void remap_bio(struct sadc_c *sc, struct bio *bio)
 {
+        pba_t pba;
+
+        if (bio_data_dir(bio) == READ)
+                pba = lookup_pba(sc, bio_begin_pba(bio));
+        else
+                pba = map_pba_range(sc, bio_begin_pba(bio), bio_end_pba(bio));
+
+        bio->bi_sector = pba_to_lba(pba);
         bio->bi_bdev = sc->dev->bdev;
-
-        if (bio_data_dir(bio) == READ) {
-                bio_begin_lba(bio) = lookup_lba(sc, bio_begin_lba(bio));
-        } else {
-                /*
-                 * Since the write is contiguous, it is enough to update the lba
-                 * of the bio for it to proceed.  In the case of bios with
-                 * multiple segments, we need to update our internal map as
-                 * well, therefore we execute map_pba for the remaining pbas for
-                 * the side effect of updating |sc->pba_map|.
-                 */
-                pba_t pba = bio_begin_pba(bio);
-                pba_t end_pba = bio_end_pba(bio);
-
-                bio_begin_lba(bio) = map_lba(sc, bio_begin_lba(bio));
-
-                for (++pba; pba < end_pba; ++pba)
-                        map_pba(sc, pba);
-        }
 
         debug_bio(sc, bio, __func__);
 }
 
-static void init_bio(struct io *io, struct bio *bio,
-                     lba_t lba, int idx, int nr_pbas)
-{
-        struct sadc_c *sc = io->sc;
-
-        bio->bi_private = io;
-        bio->bi_end_io = endio;
-        bio->bi_idx = idx;
-        bio->bi_vcnt = idx + nr_pbas;
-        bio->bi_sector = lba;
-        bio->bi_size = nr_pbas * PBA_SIZE;
-        bio->bi_bdev = sc->dev->bdev;
-}
-
-static struct bio *clone_bio(struct io *io, struct bio *bio,
-                             lba_t lba, int idx, int nr_pbas)
+static struct bio *clone_and_remap_bio(struct io *io, struct bio *bio,
+                                       pba_t pba, int idx, int nr_pbas)
 {
         struct sadc_c *sc = io->sc;
         struct bio *clone;
@@ -567,7 +534,19 @@ static struct bio *clone_bio(struct io *io, struct bio *bio,
                 return NULL;
         }
 
-        init_bio(io, clone, lba, idx, nr_pbas);
+        if (bio_data_dir(bio) == READ)
+                pba = lookup_pba(sc, pba);
+        else
+                pba = map_pba_range(sc, pba, pba + nr_pbas);
+
+        clone->bi_sector = pba_to_lba(pba);
+        clone->bi_private = io;
+        clone->bi_end_io = endio;
+        clone->bi_idx = idx;
+        clone->bi_vcnt = idx + nr_pbas;
+        clone->bi_size = nr_pbas * PBA_SIZE;
+        clone->bi_bdev = sc->dev->bdev;
+
         atomic_inc(&io->pending);
 
         return clone;
@@ -581,30 +560,39 @@ static void release_bio(struct bio *bio)
         bio_put(bio);
 }
 
-/* This can split a bio to at most 2. */
+/*
+ * Given a |io->bio| that potentially lies at the crossing of two bands, splits
+ * it into two.  Since a bio is always smaller than a band, this can split a bio
+ * to at most 2.
+ *
+ * It is also possible that |io->bio| does not lie at the crossing of two bands.
+ * It ended up in this code-path because the cache band it was going to be
+ * written to, required GC.  For these kind of bios, this function acts as a
+ * remap.
+ */
 static int split_write_bio(struct sadc_c *sc, struct io *io, struct bio **bios)
 {
         struct bio *bio = io->bio;
         int32_t b = bio_band(sc, bio);
-        int32_t nr_pbas = pbas_in_band(sc, bio, b);
-        lba_t lba = map_lba(sc, bio_begin_lba(bio));
-        int32_t idx = 0;
+        int32_t nr_pbas_bio1 = pbas_in_band(sc, bio, b);
+        int32_t nr_pbas_bio2 = pbas_in_bio(bio) - nr_pbas_bio1;
+        pba_t pba = bio_begin_pba(bio);
 
-        bios[0] = clone_bio(io, bio, lba, idx, nr_pbas);
+        bios[0] = clone_and_remap_bio(io, bio, pba, 0, nr_pbas_bio1);
         if (!bios[0])
                 return io->error = -ENOMEM;
 
-        nr_pbas = bio_pbas(bio) - nr_pbas;
-        if (!nr_pbas)
+        if (!nr_pbas_bio2)
                 return 1;
 
-        lba = map_lba(sc, pba_to_lba(bio_begin_pba(bio) + nr_pbas));
-        idx += nr_pbas;
-        bios[1] = clone_bio(io, bio, lba, idx, nr_pbas);
+        pba += nr_pbas_bio1;
+
+        bios[1] = clone_and_remap_bio(io, bio, pba, nr_pbas_bio1, nr_pbas_bio2);
         if (!bios[1]) {
                 release_bio(bios[0]);
                 return io->error = -ENOMEM;
         }
+
         return 2;
 }
 
@@ -613,18 +601,18 @@ static int split_read_bio(struct sadc_c *sc, struct io *io, struct bio **bios)
         struct bio *bio = io->bio;
         pba_t pba = bio_begin_pba(bio);
         pba_t end_pba = bio_end_pba(bio);
-        lba_t lba = lookup_lba(sc, bio_begin_lba(bio));
+        pba_t p = pba;
         int i = 0, n = 0, idx = 0;
 
         for (++i, ++pba; pba < end_pba; ++pba, ++i) {
-                if (adjacent(sc, pba-1, pba))
+                if (adjacent_pbas(sc, pba - 1, pba))
                         continue;
-                bios[n] = clone_bio(io, bio, lba, idx, i - idx);
+                bios[n] = clone_and_remap_bio(io, bio, p, idx, i - idx);
                 if (!bios[n])
                         goto bad;
-                lba = lookup_lba(sc, pba_to_lba(pba)), idx = i, ++n;
+                p = pba, idx = i, ++n;
         }
-        bios[n] = clone_bio(io, bio, lba, idx, i - idx);
+        bios[n] = clone_and_remap_bio(io, bio, p, idx, i - idx);
         if (bios[n])
                 return n + 1;
 
@@ -636,7 +624,7 @@ bad:
 
 typedef int (*split_t)(struct sadc_c *sc, struct io *io, struct bio **bios);
 
-static void complete_split_io(struct sadc_c *sc, struct io *io, split_t split)
+static void complete_slow_io(struct sadc_c *sc, struct io *io, split_t split)
 {
         int i, n;
 
@@ -647,9 +635,6 @@ static void complete_split_io(struct sadc_c *sc, struct io *io, split_t split)
         }
 
         WARN_ON(bio_data_dir(io->bio) == READ && n == 1);
-
-        if (bio_data_dir(io->bio) == READ)
-                WARN_ON(n == 1);
 
         for (i = 0; i < n; ++i)
                 generic_make_request(sc->tmp_bios[i]);
@@ -663,7 +648,7 @@ static void complete_split_io(struct sadc_c *sc, struct io *io, split_t split)
  *   handled in |sadc_map| because a simple remap is enough for this.
  *
  * - Aligned, crosses bands, none of the sections require GC.  We will
- *   handle this case below, via |do_split_io|.
+ *   handle this case below.
  *
  * - Aligned, does not cross bands, requires GC.  This requires GC of a
  *   single cache band.
@@ -685,7 +670,7 @@ static void do_start_gc(struct sadc_c *sc)
         struct cache_band *cb = cache_band(sc, b);
 
         WARN_ON(sc->error);
-        WARN_ON(does_not_require_gc(sc, bio));
+        WARN_ON(does_not_require_gc_bio(sc, bio));
 
         DMINFO("Starting GC...");
 
@@ -773,7 +758,7 @@ static bool allocate_rmw_bios(struct sadc_c *sc)
         pba = band_begin_pba(sc, sc->rmw_band);
 
         for (i = 0; i < sc->band_size_pbas; ++i) {
-                sc->rmw_bios[i] = alloc_bio_with_page(sc, pba_to_lba(pba+i));
+                sc->rmw_bios[i] = alloc_bio_with_page(sc, pba_to_lba(pba + i));
                 if (!sc->rmw_bios[i])
                         goto bad;
         }
@@ -800,7 +785,7 @@ static void do_start_cache_band_gc(struct sadc_c *sc)
                 sc->error = -ENOMEM;
 }
 
-static struct bio *tmp_clone_bio(struct io *io, struct bio *bio, lba_t lba)
+static struct bio *clone_rmw_bio(struct io *io, struct bio *bio, pba_t pba)
 {
         struct sadc_c *sc = io->sc;
         struct bio *clone;
@@ -813,7 +798,8 @@ static struct bio *tmp_clone_bio(struct io *io, struct bio *bio, lba_t lba)
 
         clone->bi_private = io;
         clone->bi_end_io = endio;
-        clone->bi_sector = lba;
+        clone->bi_sector = pba_to_lba(pba);
+
         atomic_inc(&io->pending);
 
         return clone;
@@ -838,9 +824,7 @@ static void do_read_data_band(struct sadc_c *sc)
         pba = band_begin_pba(sc, sc->rmw_band);
 
         for (i = 0; i < sc->band_size_pbas; ++i) {
-                lba_t lba = pba_to_lba(pba+i);
-
-                sc->tmp_bios[i] = tmp_clone_bio(io, sc->rmw_bios[i], lba);
+                sc->tmp_bios[i] = clone_rmw_bio(io, sc->rmw_bios[i], pba + i);
                 if (!sc->tmp_bios[i])
                         goto bad;
         }
@@ -879,12 +863,12 @@ static void do_modify_data_band(struct sadc_c *sc)
         pba = band_begin_pba(sc, sc->rmw_band);
 
         for (i = j = 0; i < sc->band_size_pbas; ++i) {
-                lba_t lba = lookup_lba(sc, bio_begin_lba(sc->rmw_bios[i]));
+                pba_t p = lookup_pba(sc, bio_begin_pba(sc->rmw_bios[i]));
 
-                if (lba == pba_to_lba(pba+i))
+                if (p == pba + i)
                         continue;
 
-                sc->tmp_bios[j] = tmp_clone_bio(io, sc->rmw_bios[i], lba);
+                sc->tmp_bios[j] = clone_rmw_bio(io, sc->rmw_bios[i], p);
                 if (!sc->tmp_bios[j])
                         goto bad;
                 ++j;
@@ -934,6 +918,7 @@ static void do_write_data_band(struct sadc_c *sc)
                 sc->rmw_bios[i]->bi_private = io;
                 sc->rmw_bios[i]->bi_end_io = endio;
                 sc->rmw_bios[i]->bi_rw = WRITE;
+
                 generic_make_request(sc->rmw_bios[i]);
         }
 }
@@ -968,7 +953,7 @@ static void do_gc_complete(struct sadc_c *sc)
         reset_cache_band(sc, sc->gc_band);
         sc->gc_band = NULL;
 
-        if (does_not_require_gc(sc, bio)) {
+        if (does_not_require_gc_bio(sc, bio)) {
                 sc->state = STATE_NONE;
                 queue_io(sc->pending_io);
                 sc->pending_io = NULL;
@@ -1079,12 +1064,12 @@ static void sadcd(struct work_struct *work)
         struct bio *bio = io->bio;
         struct sadc_c *sc = io->sc;
 
-        WARN_ON(!aligned(bio));
+        WARN_ON(!aligned_bio(bio));
 
         if (bio_data_dir(bio) == READ)
-                complete_split_io(sc, io, split_read_bio);
-        else if (does_not_require_gc(sc, bio))
-                complete_split_io(sc, io, split_write_bio);
+                complete_slow_io(sc, io, split_read_bio);
+        else if (does_not_require_gc_bio(sc, bio))
+                complete_slow_io(sc, io, split_write_bio);
         else
                 start_gc(sc, io);
 }
@@ -1336,8 +1321,8 @@ static int sadc_map(struct dm_target *ti, struct bio *bio)
 
         debug_bio(sc, bio, __func__);
 
-        if (fast(sc, bio)) {
-                remap(sc, bio);
+        if (fast_bio(sc, bio)) {
+                remap_bio(sc, bio);
                 return DM_MAPIO_REMAPPED;
         }
 

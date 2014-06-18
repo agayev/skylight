@@ -406,6 +406,11 @@ static pba_t lookup_pba(struct sadc_c *sc, pba_t pba)
         return sc->pba_map[pba];
 }
 
+static lba_t lookup_lba(struct sadc_c *sc, lba_t lba)
+{
+        return pba_to_lba(lookup_pba(sc, lba_to_pba(lba))) + lba % LBAS_IN_PBA;
+}
+
 static pba_t map_pba_range(struct sadc_c *sc, pba_t begin, pba_t end)
 {
         pba_t i;
@@ -509,14 +514,16 @@ static bool fast_bio(struct sadc_c *sc, struct bio *bio)
 
 static void remap_bio(struct sadc_c *sc, struct bio *bio)
 {
-        pba_t pba;
+        lba_t lba;
 
         if (bio_data_dir(bio) == READ)
-                pba = lookup_pba(sc, bio_begin_pba(bio));
+                lba = lookup_lba(sc, bio_begin_lba(bio));
         else
-                pba = map_pba_range(sc, bio_begin_pba(bio), bio_end_pba(bio));
+                lba = pba_to_lba(map_pba_range(sc,
+                                               bio_begin_pba(bio),
+                                               bio_end_pba(bio)));
 
-        bio->bi_sector = pba_to_lba(pba);
+        bio->bi_sector = lba;
         bio->bi_bdev = sc->dev->bdev;
 
         debug_bio(sc, bio, __func__);

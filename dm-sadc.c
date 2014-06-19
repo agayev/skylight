@@ -965,8 +965,6 @@ static void do_gc_complete(struct sadc_c *sc)
                 queue_io(sc->pending_io);
                 sc->pending_io = NULL;
 
-                mutex_unlock(&sc->c_lock);
-
                 DMINFO("GC completed.");
         } else {
                 sc->state = STATE_START_GC;
@@ -986,11 +984,10 @@ static void do_fail_gc(struct sadc_c *sc)
         sc->pending_io = NULL;
         sc->gc_band = NULL;
 
-        mutex_unlock(&sc->c_lock);
-
         io->error = -EIO;
-        pr_debug("GC failed.\n");
         release_io(io);
+
+        DMINFO("GC failed.");
 }
 
 static void gc(struct sadc_c *sc)
@@ -1049,13 +1046,23 @@ static void gc(struct sadc_c *sc)
                 WARN_ON(sc->error == -EINPROGRESS);
                 do_fail_gc(sc);
         }
+
+        mutex_unlock(&sc->c_lock);
 }
 
 static void start_gc(struct sadc_c *sc, struct io *io)
 {
-        debug_bio(sc, io->bio, __func__);
+        struct bio *bio = io->bio;
+
+        debug_bio(sc, bio, __func__);
 
         mutex_lock(&sc->c_lock);
+
+        if (does_not_require_gc_bio(sc, bio)) {
+                queue_io(io);
+                mutex_unlock(&sc->c_lock);
+                return;
+        }
 
         sc->pending_io = io;
         sc->state = STATE_START_GC;

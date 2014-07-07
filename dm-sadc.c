@@ -280,10 +280,29 @@ static inline lba_t lookup_lba(struct sadc_ctx *sc, lba_t lba)
         return pba_to_lba(lookup_pba(sc, lba_to_pba(lba))) + lba % LBAS_IN_PBA;
 }
 
+static void do_free_bio_pages(struct sadc_ctx *sc, struct bio *bio)
+{
+        int i;
+        struct bio_vec *bv;
+
+        bio_for_each_segment_all(bv, bio, i) {
+                WARN_ON(!bv->bv_page);
+                mempool_free(bv->bv_page, sc->page_pool);
+                bv->bv_page = NULL;
+        }
+
+        /* For now we should only have a single page per bio. */
+        WARN_ON(i != 1);
+}
+
 static void endio(struct bio *bio, int error)
 {
         struct io *io = bio->bi_private;
         struct sadc_ctx *sc = io->sc;
+        bool rmw_bio = io->bio == NULL;
+
+        if (rmw_bio && bio_data_dir(bio) == WRITE)
+                do_free_bio_pages(sc, bio);
 
         bio_put(bio);
 
@@ -470,21 +489,6 @@ static struct cache_band *cache_band_to_gc(struct sadc_ctx *sc, struct bio *bio)
         nr_pbas = pbas_in_bio(bio) - nr_pbas;
 
         return free_pbas_in_cache_band(sc, cb) < nr_pbas ? cb : NULL;
-}
-
-static void do_free_bio_pages(struct sadc_ctx *sc, struct bio *bio)
-{
-        int i;
-        struct bio_vec *bv;
-
-        bio_for_each_segment_all(bv, bio, i) {
-                WARN_ON(!bv->bv_page);
-                mempool_free(bv->bv_page, sc->page_pool);
-                bv->bv_page = NULL;
-        }
-
-        /* For now we should only have a single page per bio. */
-        WARN_ON(i != 1);
 }
 
 static struct bio *alloc_bio_with_page(struct sadc_ctx *sc, pba_t pba)
